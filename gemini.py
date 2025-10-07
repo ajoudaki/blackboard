@@ -8,89 +8,80 @@ import time
 
 # --- 1. Configuration & Vocabulary ---
 
-# Set device for training
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Vocabulary mapping characters to integers
-VOCAB = list("0123456789+- =") + ["[CLS]", "[EOS]"]
-
+# Vocabulary WITHOUT the [MASK] token
+VOCAB = list("0123456789+- =")
 stoi = {c: i for i, c in enumerate(VOCAB)}
 itos = {i: c for i, c in enumerate(VOCAB)}
 
 # Hyperparameters
-GRID_SIZE = (5, 8)  # (Height, Width) for the blackboard
-NUM_DIGITS = 3      # Number of digits for the addition problems
-D_MODEL = 128       # Model dimension
-NHEAD = 8           # Number of attention heads
-NUM_LAYERS = 6      # Number of Transformer layers
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 20
-NUM_SAMPLES = 5000  # Number of training samples to generate
+GRID_SIZE = (5, 8)
+NUM_DIGITS = 3
+D_MODEL = 128
+NHEAD = 8
+NUM_LAYERS = 6
+BATCH_SIZE = 128
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY=0.01
+NUM_EPOCHS = 25
+NUM_SAMPLES = 5000
+POS_EMBEDDING_TYPE = 'ROPE'
 
-# --- 2. Data Generation ---
+# --- 2. Data Generation (State Transition Approach) ---
 
-def generate_addition_problem(num_digits, grid_h, grid_w):
-    """
-    Generates a multi-digit addition problem and its step-by-step solution trace.
-    Each step consists of the board state and the next action (row, col, symbol).
-    """
+def generate_state_transitions(num_digits, grid_h, grid_w):
+    """Generates a sequence of (board_t, board_t+1) state transitions."""
     a = random.randint(10**(num_digits-1), 10**num_digits - 1)
     b = random.randint(10**(num_digits-1), 10**num_digits - 1)
     c = a + b
 
-    # Format the problem onto the blackboard
-    problem = f"{a:>{num_digits+1}}\n+{b:>{num_digits}}\n{'-'*(num_digits+1)}"
-    lines = problem.split('\n')
-    
     board = [[' ' for _ in range(grid_w)] for _ in range(grid_h)]
+    problem_str = f"{a:>{num_digits+1}}\n+{b:>{num_digits}}\n{'-'*(num_digits+1)}"
+    lines = problem_str.split('\n')
     for r, line in enumerate(lines):
-        for c, char in enumerate(line):
-            board[r+1][grid_w - len(line) + c] = char
-    
-    solution_trace = []
-    str_c = str(c)
+        for col, char in enumerate(line):
+            board[r+1][grid_w - len(line) + col] = char
+
+    state_transitions = []
     carry = 0
     
-    # Simulate the column-by-column addition algorithm
+    # Simulate the algorithm, storing the board state at each step
     for i in range(num_digits):
         col_idx = grid_w - 1 - i
-        digit_a = int(board[1][col_idx]) if board[1][col_idx].isdigit() else 0
-        digit_b = int(board[2][col_idx]) if board[2][col_idx].isdigit() else 0
+        digit_a = int(board[1][col_idx])
+        digit_b = int(board[2][col_idx])
         
         current_sum = digit_a + digit_b + carry
         result_digit = current_sum % 10
-        carry = current_sum // 10
+        new_carry = current_sum // 10
 
-        # Step 1: Write the result digit
-        current_board_state = [row[:] for row in board]
-        solution_trace.append((current_board_state, (3, col_idx, str(result_digit))))
+        # Step 1: Add the result digit
+        prev_board_state = [row[:] for row in board]
         board[3][col_idx] = str(result_digit)
+        state_transitions.append((prev_board_state, [row[:] for row in board]))
 
-        # Step 2: Write the carry digit (if any)
-        if carry > 0 and i < num_digits - 1:
-            current_board_state = [row[:] for row in board]
-            solution_trace.append((current_board_state, (0, col_idx - 1, str(carry))))
-            board[0][col_idx-1] = str(carry)
+        # Step 2: Add the carry digit
+        if new_carry > 0:
+            prev_board_state = [row[:] for row in board]
+            board[0][col_idx - 1] = str(new_carry)
+            state_transitions.append((prev_board_state, [row[:] for row in board]))
+        
+        carry = new_carry
             
-    # Handle final carry
-    if carry > 0:
+    # Handle final carry if it results in a new digit
+    if str(c)[0] == '1' and len(str(c)) > num_digits:
         col_idx = grid_w - 1 - num_digits
-        current_board_state = [row[:] for row in board]
-        solution_trace.append((current_board_state, (3, col_idx, str(carry))))
-        board[3][col_idx] = str(carry)
-    
-    # Add final state with EOS token
-    current_board_state = [row[:] for row in board]
-    solution_trace.append((current_board_state, (0, 0, '[EOS]')))
-
-    return solution_trace
+        prev_board_state = [row[:] for row in board]
+        board[3][col_idx] = '1'
+        state_transitions.append((prev_board_state, [row[:] for row in board]))
+        
+    return state_transitions
 
 
 # --- 3. Dataset ---
 
 class BlackboardDataset(Dataset):
-    """PyTorch Dataset for blackboard reasoning problems."""
     def __init__(self, data):
         self.data = data
 
@@ -98,207 +89,192 @@ class BlackboardDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        board_state, (r, c, symbol) = self.data[idx]
-        
-        # Convert board to tensor of token IDs
-        board_tensor = torch.tensor(
-            [[stoi[char] for char in row] for row in board_state], dtype=torch.long
-        )
-        
-        # Convert target action to tensors
-        target_r = torch.tensor(r, dtype=torch.long)
-        target_c = torch.tensor(c, dtype=torch.long)
-        target_symbol = torch.tensor(stoi[symbol], dtype=torch.long)
-        
-        return board_tensor, target_r, target_c, target_symbol
+        input_board, target_board = self.data[idx]
+        input_tensor = torch.tensor([[stoi[c] for c in row] for row in input_board], dtype=torch.long)
+        target_tensor = torch.tensor([[stoi[c] for c in row] for row in target_board], dtype=torch.long)
+        return input_tensor, target_tensor
 
-# --- 4. Model Architecture ---
+# --- 4. Model Architecture (No changes needed) ---
+
+class RoPETransformerEncoderLayer(nn.TransformerEncoderLayer):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, batch_first=True):
+        super().__init__(d_model, nhead, dim_feedforward, dropout, batch_first=batch_first)
+    def _sa_block(self, x, attn_mask, key_padding_mask, pos_ids=None, rope=None):
+        if rope is not None and pos_ids is not None:
+            q = k = rope.rotate_queries_and_keys(x, pos_ids)
+            return self.self_attn(q, k, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
+        else:
+            return self.self_attn(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)[0]
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, pos_ids=None, rope=None):
+        x = src
+        x = x + self.dropout1(self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, pos_ids, rope))
+        x = x + self.dropout2(self._ff_block(self.norm2(x)))
+        return x
+
+class RotaryPositionalEmbedding2D(nn.Module):
+    def __init__(self, d_model, grid_size):
+        super().__init__()
+        self.d_row, self.d_col = d_model // 2, d_model - d_model // 2
+        self.max_h, self.max_w = grid_size
+        freqs_row = self._precompute_freqs(self.d_row, self.max_h)
+        freqs_col = self._precompute_freqs(self.d_col, self.max_w)
+        self.register_buffer('freqs_row_cos', freqs_row['cos']); self.register_buffer('freqs_row_sin', freqs_row['sin'])
+        self.register_buffer('freqs_col_cos', freqs_col['cos']); self.register_buffer('freqs_col_sin', freqs_col['sin'])
+    def _precompute_freqs(self, dim, max_pos, theta=10000.0):
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_pos, device=inv_freq.device).type_as(inv_freq)
+        freqs = torch.einsum("i,j->ij", t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1); return {'cos': emb.cos(), 'sin': emb.sin()}
+    def _apply_rotary_emb(self, x, cos, sin):
+        x2 = torch.cat([-x[..., 1::2], x[..., 0::2]], dim=-1); return x * cos + x2 * sin
+    def rotate_queries_and_keys(self, x, pos_ids):
+        x_row, x_col = x[..., :self.d_row], x[..., self.d_row:]
+        row_ids, col_ids = pos_ids[..., 0], pos_ids[..., 1]
+        cos_row, sin_row = self.freqs_row_cos[row_ids], self.freqs_row_sin[row_ids]
+        cos_col, sin_col = self.freqs_col_cos[col_ids], self.freqs_col_sin[col_ids]
+        return torch.cat([self._apply_rotary_emb(x_row, cos_row, sin_row), self._apply_rotary_emb(x_col, cos_col, sin_col)], dim=-1)
 
 class BlackboardTransformer(nn.Module):
-    """
-    Transformer model that learns to reason on a 2D blackboard.
-    It takes the entire board state and predicts the next (row, col, symbol) action.
-    """
-    def __init__(self, vocab_size, d_model, nhead, num_layers, grid_size):
+    def __init__(self, vocab_size, d_model, nhead, num_layers, grid_size, pe_type='ROPE'):
         super().__init__()
         self.grid_h, self.grid_w = grid_size
-        self.d_model = d_model
-
-        # Embeddings
+        self.pe_type = pe_type
         self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_embedding_2d = self._create_2d_sinusoidal_embedding()
+        if self.pe_type == 'ROPE':
+            self.rope = RotaryPositionalEmbedding2D(d_model, grid_size)
+            encoder_layer = RoPETransformerEncoderLayer(d_model, nhead, dim_feedforward=4*d_model)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        else: # ABSOLUTE
+            self.register_buffer('pos_embedding_2d_buffer', self._create_2d_sinusoidal_embedding(d_model))
+            encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=4*d_model, batch_first=True)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.output_head = nn.Linear(d_model, vocab_size)
 
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=4*d_model, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-
-        # Prediction Heads
-        self.row_head = nn.Linear(d_model, self.grid_h)
-        self.col_head = nn.Linear(d_model, self.grid_w)
-        self.symbol_head = nn.Linear(d_model, vocab_size)
-
-        # Special [CLS] token for aggregating global board state
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-
-    def _create_2d_sinusoidal_embedding(self):
-        """Creates and registers a fixed 2D sinusoidal positional embedding."""
-        pos_embedding = torch.zeros(self.grid_h, self.grid_w, self.d_model)
+    def _create_2d_sinusoidal_embedding(self, d_model):
+        pos_embedding = torch.zeros(self.grid_h, self.grid_w, d_model)
         pos = torch.arange(max(self.grid_h, self.grid_w), dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, self.d_model, 2).float() * (-math.log(10000.0) / self.d_model))
-        
-        # Row embeddings (even dimensions)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe_row = torch.sin(pos[:self.grid_h] * div_term)
         pos_embedding[:, :, 0::2] = pe_row.unsqueeze(1).repeat(1, self.grid_w, 1)
-
-        # Column embeddings (odd dimensions)
         pe_col = torch.cos(pos[:self.grid_w] * div_term)
         pos_embedding[:, :, 1::2] = pe_col.unsqueeze(0).repeat(self.grid_h, 1, 1)
-
-        self.register_buffer('pos_embedding_2d_buffer', pos_embedding.flatten(0, 1)) # (H*W, D)
-        return self.pos_embedding_2d_buffer
+        return pos_embedding.flatten(0, 1)
 
     def forward(self, board):
-            B, H, W = board.shape
-            
-            # 1. Flatten board and add token embeddings
-            flat_board = board.view(B, H * W)
-            token_emb = self.token_embedding(flat_board) # (B, H*W, D)
-            
-            # 2. Add 2D positional embeddings
-            # Use the registered buffer name 'pos_embedding_2d_buffer' here (CORRECTED)
-            pos_emb = self.pos_embedding_2d_buffer.unsqueeze(0).repeat(B, 1, 1) # (B, H*W, D)
+        B, H, W = board.shape
+        flat_board = board.view(B, H * W)
+        token_emb = self.token_embedding(flat_board)
+        if self.pe_type == 'ROPE':
+            rows = torch.arange(H, device=board.device).view(1, H, 1).expand(B, H, W)
+            cols = torch.arange(W, device=board.device).view(1, 1, W).expand(B, H, W)
+            pos_ids = torch.stack([rows, cols], dim=-1).view(B, H * W, 2)
+            x = token_emb
+            for layer in self.transformer_encoder.layers:
+                x = layer(x, pos_ids=pos_ids, rope=self.rope)
+        else: # ABSOLUTE
+            pos_emb = self.pos_embedding_2d_buffer.unsqueeze(0).repeat(B, 1, 1)
             x = token_emb + pos_emb
-            
-            # 3. Prepend [CLS] token
-            cls_tokens = self.cls_token.repeat(B, 1, 1)
-            x = torch.cat([cls_tokens, x], dim=1) # (B, 1 + H*W, D)
-
-            # 4. Pass through Transformer
-            transformer_out = self.transformer_encoder(x)
-            
-            # 5. Use the output of the [CLS] token for prediction
-            cls_out = transformer_out[:, 0] # (B, D)
-            
-            # 6. Predict row, column, and symbol
-            row_logits = self.row_head(cls_out)
-            col_logits = self.col_head(cls_out)
-            symbol_logits = self.symbol_head(cls_out)
-            
-            return row_logits, col_logits, symbol_logits
+            x = self.transformer_encoder(x)
+        logits = self.output_head(x)
+        return logits
 
 # --- 5. Training and Inference ---
 
 def train():
-    """Main function to generate data, train the model, and run inference."""
     print(f"Using device: {device}")
+    print(f"Using Positional Embedding: {POS_EMBEDDING_TYPE}")
     
-    # 1. Generate Data
     print("Generating training data...")
-    all_traces = []
+    all_transitions = []
     for _ in range(NUM_SAMPLES):
-        trace = generate_addition_problem(NUM_DIGITS, GRID_SIZE[0], GRID_SIZE[1])
-        all_traces.extend(trace)
+        all_transitions.extend(generate_state_transitions(NUM_DIGITS, GRID_SIZE[0], GRID_SIZE[1]))
     
-    dataset = BlackboardDataset(all_traces)
+    dataset = BlackboardDataset(all_transitions)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
-    # 2. Initialize Model, Loss, and Optimizer
-    model = BlackboardTransformer(
-        vocab_size=len(VOCAB),
-        d_model=D_MODEL,
-        nhead=NHEAD,
-        num_layers=NUM_LAYERS,
-        grid_size=GRID_SIZE
-    ).to(device)
+    model = BlackboardTransformer(len(VOCAB), D_MODEL, NHEAD, NUM_LAYERS, GRID_SIZE, POS_EMBEDDING_TYPE).to(device)
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    # Use an ignore_index that is not in our vocabulary
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     
-    # 3. Training Loop
     print("Starting training...")
     start_time = time.time()
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
-        for batch in dataloader:
-            boards, targets_r, targets_c, targets_s = [b.to(device) for b in batch]
+        for input_boards, target_boards in dataloader:
+            input_boards, target_boards = input_boards.to(device), target_boards.to(device)
             
             optimizer.zero_grad()
-            logits_r, logits_c, logits_s = model(boards)
+            logits = model(input_boards) # (B, H*W, V)
             
-            loss_r = criterion(logits_r, targets_r)
-            loss_c = criterion(logits_c, targets_c)
-            loss_s = criterion(logits_s, targets_s)
+            # Create a target for the loss function that only includes the changed cells
+            loss_target = target_boards.clone()
+            # loss_target[input_boards == target_boards] = -100 # Ignore unchanged cells
             
-            loss = loss_r + loss_c + loss_s
+            loss = criterion(logits.view(-1, len(VOCAB)), loss_target.view(-1))
+            
             loss.backward()
             optimizer.step()
-            
             total_loss += loss.item()
         
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Loss: {avg_loss:.4f}")
 
-    end_time = time.time()
-    print(f"Training finished in {end_time - start_time:.2f} seconds.")
+    print(f"Training finished in {time.time() - start_time:.2f} seconds.")
 
-    # 4. Run Inference Example
     print("\n--- Running Inference Example ---")
-    infer(model, num_digits=NUM_DIGITS) # Test on same number of digits
+    infer(model, num_digits=NUM_DIGITS)
     print("\n--- Running Generalization Example (harder) ---")
-    infer(model, num_digits=NUM_DIGITS + 1) # Test on more digits
+    infer(model, num_digits=NUM_DIGITS + 1)
 
 def infer(model, num_digits):
-    """Runs the model autoregressively to solve a new addition problem."""
+    """Solves a problem autoregressively by predicting the next board state."""
     model.eval()
     
-    # Create a new problem
-    a = random.randint(10**(num_digits-1), 10**num_digits - 1)
-    b = random.randint(10**(num_digits-1), 10**num_digits - 1)
-    problem = f"{a:>{num_digits+1}}\n+{b:>{num_digits}}\n{'-'*(num_digits+1)}"
-    lines = problem.split('\n')
-    
+    try:
+        a = random.randint(10**(num_digits-1), 10**num_digits - 1)
+        b = random.randint(10**(num_digits-1), 10**num_digits - 1)
+    except ValueError:
+        print(f"Cannot generate a {num_digits}-digit number. Skipping inference.")
+        return
+        
+    problem_str = f"{a:>{num_digits+1}}\n+{b:>{num_digits}}\n{'-'*(num_digits+1)}"
     board = [[' ' for _ in range(GRID_SIZE[1])] for _ in range(GRID_SIZE[0])]
+    lines = problem_str.split('\n')
     for r, line in enumerate(lines):
-        if r + 1 < GRID_SIZE[0] and len(line) < GRID_SIZE[1]:
-          for c, char in enumerate(line):
-              board[r+1][GRID_SIZE[1] - len(line) + c] = char
+        if r + 1 < GRID_SIZE[0] and GRID_SIZE[1] - len(line) >= 0:
+            for c, char in enumerate(line):
+                board[r+1][GRID_SIZE[1] - len(line) + c] = char
 
-    def print_board(b):
+    def print_board(b, step):
+        print(f"\n--- Step {step} ---")
         print("\n".join("".join(row) for row in b))
-        print("-" * GRID_SIZE[1])
 
-    print("Initial Problem:")
-    print_board(board)
+    print("--- Initial Problem ---")
+    print("\n".join("".join(row) for row in board))
     
     with torch.no_grad():
-        for step in range(num_digits * 3): # Set a max number of steps
-            board_tensor = torch.tensor(
-                [[stoi[c] for c in row] for row in board], dtype=torch.long
-            ).unsqueeze(0).to(device)
+        for step in range(num_digits * 2 + 2): # Max steps for completion
+            board_tensor = torch.tensor([[stoi[c] for c in row] for row in board], dtype=torch.long).unsqueeze(0).to(device)
             
-            logits_r, logits_c, logits_s = model(board_tensor)
+            logits = model(board_tensor) # (1, H*W, V)
+            predictions = logits.argmax(dim=-1).view(1, GRID_SIZE[0], GRID_SIZE[1])
             
-            pred_r = logits_r.argmax(dim=-1).item()
-            pred_c = logits_c.argmax(dim=-1).item()
-            pred_s_idx = logits_s.argmax(dim=-1).item()
-            pred_symbol = itos[pred_s_idx]
+            # Create the new board from predictions
+            new_board = [[itos[p.item()] for p in row] for row in predictions[0]]
             
-            if pred_symbol == '[EOS]':
-                print(f"\nStep {step+1}: Model predicted [EOS]. Solution complete.")
+            # If the model outputs the same board, it's done or stuck
+            if new_board == board:
+                print("\nModel has converged. Solution complete.")
                 break
             
-            print(f"\nStep {step+1}: Model writes '{pred_symbol}' at ({pred_r}, {pred_c})")
-            
-            if 0 <= pred_r < GRID_SIZE[0] and 0 <= pred_c < GRID_SIZE[1]:
-                board[pred_r][pred_c] = pred_symbol
-                print_board(board)
-            else:
-                print("Predicted position is out of bounds. Stopping.")
-                break
-    
-    print("\nFinal Board State:")
-    print_board(board)
+            board = new_board
+            print_board(board, step + 1)
+
+    print("\n--- Final Board State ---")
+    print("\n".join("".join(row) for row in board))
     print(f"Correct Answer: {a+b}")
 
 if __name__ == '__main__':
