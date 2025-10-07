@@ -140,6 +140,7 @@ class BlackboardTransformer(nn.Module):
 
 # --- 5. Generic Training & Inference Functions ---
 
+
 def preprocess_data_on_gpu(all_transitions, stoi_map, device):
     """Tokenizes the entire dataset and moves it to the GPU as two large tensors."""
     if not all_transitions:
@@ -158,11 +159,17 @@ def preprocess_data_on_gpu(all_transitions, stoi_map, device):
     return all_input_boards, all_target_boards
 
 def run_training_loop(model, all_input_boards, all_target_boards, epochs, lr, batch_size, vocab):
+    """
+    Runs the training loop with pre-loaded GPU data and Automatic Mixed Precision (AMP).
+    """
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     num_samples = all_input_boards.size(0)
     
-    print("Starting training with pre-loaded GPU data...")
+    # NEW: Initialize a gradient scaler for mixed precision
+    scaler = torch.cuda.amp.GradScaler()
+
+    print("Starting training with pre-loaded GPU data and Mixed Precision...")
     start_time = time.time()
     for epoch in range(epochs):
         model.train()
@@ -172,21 +179,29 @@ def run_training_loop(model, all_input_boards, all_target_boards, epochs, lr, ba
         
         for i in range(0, num_samples, batch_size):
             batch_indices = indices[i:i+batch_size]
-            
-            # Create a mini-batch by slicing the large tensors on the GPU
             input_boards = all_input_boards[batch_indices]
             target_boards = all_target_boards[batch_indices]
             
-            optimizer.zero_grad()
-            logits = model(input_boards)
-            loss = criterion(logits.view(-1, len(vocab)), target_boards.view(-1))
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True) # set_to_none=True for improved performance
+
+            # NEW: Use autocast for the forward pass
+            with torch.cuda.amp.autocast():
+                logits = model(input_boards)
+                loss = criterion(logits.view(-1, len(vocab)), target_boards.view(-1))
+
+            # NEW: Scale the loss and perform backward pass
+            scaler.scale(loss).backward()
+            
+            # NEW: Unscale the gradients and update the weights
+            scaler.step(optimizer)
+            scaler.update()
+            
             total_loss += loss.item()
         
         avg_loss = total_loss / (num_samples / batch_size)
         print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
     print(f"Training finished in {time.time() - start_time:.2f} seconds.")
+
 
 def infer_addition(model, num_digits, grid_size, stoi, itos):
     # (inference code remains the same as previous version)
@@ -259,7 +274,7 @@ def setup_and_train_alignment():
     # --- Config ---
     VOCAB = list("ACGT0123456789-=") + [' ']; stoi = {c: i for i, c in enumerate(VOCAB)}; itos = {i: c for i, c in enumerate(VOCAB)}
     SEQ_LEN = 5; GRID_SIZE = (SEQ_LEN + 3, SEQ_LEN + 3); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
-    BATCH_SIZE = 256; LEARNING_RATE = 1e-4; NUM_EPOCHS = 10; NUM_SAMPLES = 4000
+    BATCH_SIZE = 256; LEARNING_RATE = 1e-3; NUM_EPOCHS = 20; NUM_SAMPLES = 4000
     
     print("Generating training data for ALIGNMENT...")
     all_transitions = []
