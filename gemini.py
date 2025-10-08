@@ -60,7 +60,8 @@ def generate_alignment_transitions(seq_len, grid_h, grid_w):
     board = [[' ' for _ in range(grid_w)] for _ in range(grid_h)]
     board_offset = 1
     for i, char in enumerate(seq1): board[0][i + board_offset + 1] = char
-    for i, char in enumerate(seq2): board[i + board_offset][0] = char
+    # CORRECTED: Shift seq2 down by one row to align correctly
+    for i, char in enumerate(seq2): board[i + board_offset + 1][0] = char
     state_transitions = []
     for k in range(len(seq1) + len(seq2) + 1):
         prev_board = [row[:] for row in board]
@@ -133,54 +134,37 @@ def get_protected_mask(grid_size, task_name, task_params, device):
     H, W = grid_size; mask = torch.zeros((H, W), dtype=torch.bool, device=device)
     if task_name == 'ADDITION':
         num_digits = task_params['NUM_DIGITS']
-        mask[1, :] = True
-        mask[2, 0:W - (num_digits+1)] = True
-        mask[2, W - (num_digits+1):] = True
-        mask[3, W - (num_digits+1):] = True
+        mask[1, :] = True; mask[2, 0:W - (num_digits+1)] = True
+        mask[2, W - (num_digits+1):] = True; mask[3, W - (num_digits+1):] = True
     elif task_name == 'ALIGNMENT':
         seq_len = task_params['SEQ_LEN']; board_offset = 1
         mask[0, board_offset+1 : board_offset+1+seq_len] = True
-        mask[board_offset : board_offset+1+seq_len+1, 0] = True
+        # CORRECTED: Shift the protected mask for seq2 down by one row
+        mask[board_offset+1 : board_offset+1+seq_len, 0] = True
     return mask.view(1, H, W)
 
 def create_bert_loss_target(input_boards, target_boards, protected_mask, vocab_size, device):
-    corrupted_boards = input_boards.clone()
-    loss_target = torch.full_like(input_boards, -100)
+    corrupted_boards = input_boards.clone(); loss_target = torch.full_like(input_boards, -100)
     primary_target_mask = (input_boards != target_boards)
     loss_target[primary_target_mask] = target_boards[primary_target_mask]
-    
-    # Candidates for MLM are all non-primary cells (including protected ones)
     candidate_mask = ~primary_target_mask
-    candidate_indices = torch.where(candidate_mask)
-    num_candidates = candidate_indices[0].size(0)
+    candidate_indices = torch.where(candidate_mask); num_candidates = candidate_indices[0].size(0)
     num_to_select = int(num_candidates * 0.30)
-    
     if num_to_select > 0:
         rand_indices = torch.randperm(num_candidates, device=device)[:num_to_select]
         selected_b, selected_h, selected_w = (candidate_indices[i][rand_indices] for i in range(3))
-        
         mlm_mask = torch.zeros_like(input_boards, dtype=torch.bool)
         mlm_mask[selected_b, selected_h, selected_w] = True
         loss_target[mlm_mask] = target_boards[mlm_mask]
-
-        # Of the selected MLM cells, find which ones are NOT protected and can be corrupted
         is_protected_mask = protected_mask.expand_as(input_boards)
         corruptible_mask = mlm_mask & ~is_protected_mask
         corruptible_indices = torch.where(corruptible_mask)
-        
-        # Corrupt 50% of the *corruptible* subset
-        num_corruptible = corruptible_indices[0].size(0)
-        num_to_corrupt = int(num_corruptible * 0.5)
-        
+        num_corruptible = corruptible_indices[0].size(0); num_to_corrupt = int(num_corruptible * 0.5)
         if num_to_corrupt > 0:
             rand_corrupt_perm = torch.randperm(num_corruptible, device=device)[:num_to_corrupt]
-            corrupt_b = corruptible_indices[0][rand_corrupt_perm]
-            corrupt_h = corruptible_indices[1][rand_corrupt_perm]
-            corrupt_w = corruptible_indices[2][rand_corrupt_perm]
-            
+            corrupt_b, corrupt_h, corrupt_w = (corruptible_indices[i][rand_corrupt_perm] for i in range(3))
             random_tokens = torch.randint(0, vocab_size, (num_to_corrupt,), device=device)
             corrupted_boards[corrupt_b, corrupt_h, corrupt_w] = random_tokens
-            
     return corrupted_boards, loss_target
 
 def preprocess_data_on_gpu(all_transitions, stoi_map, rank, world_size, device):
@@ -191,8 +175,7 @@ def preprocess_data_on_gpu(all_transitions, stoi_map, rank, world_size, device):
         input_list = [torch.tensor([[stoi_map.get(c, 0) for c in row] for row in in_b], dtype=torch.long) for in_b, _ in all_transitions]
         target_list = [torch.tensor([[stoi_map.get(c, 0) for c in row] for row in out_b], dtype=torch.long) for _, out_b in all_transitions]
         all_input_boards = torch.stack(input_list).to(device); all_target_boards = torch.stack(target_list).to(device)
-        if rank == 0: print(f"Data generated on rank 0 and moved to {device}. Shape: {all_input_boards.shape}")
-    
+        print(f"Data generated on rank 0 and moved to {device}. Shape: {all_input_boards.shape}")
     size_tensor = torch.empty(3, dtype=torch.long, device=device)
     if rank == 0: size_tensor[0], size_tensor[1], size_tensor[2] = all_input_boards.shape
     dist.broadcast(size_tensor, src=0)
@@ -255,7 +238,8 @@ def infer_alignment(model, seq_len, grid_size, stoi, itos, device):
     board = [[' ' for _ in range(grid_size[1])] for _ in range(grid_size[0])]
     board_offset = 1
     for i, char in enumerate(seq1): board[0][i+board_offset+1] = char
-    for i, char in enumerate(seq2): board[i+board_offset][0] = char
+    # CORRECTED: Shift seq2 down by one row to align correctly
+    for i, char in enumerate(seq2): board[i+board_offset+1][0] = char
     print("--- Initial Problem ---"); print(f"Seq1: {seq1}\nSeq2: {seq2}"); print("\n".join("".join(row) for row in board))
     with torch.no_grad():
         for step in range((seq_len+1)**2 + 1):
