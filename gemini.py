@@ -14,14 +14,13 @@ TASK = 'ALIGNMENT' # Options: 'ADDITION', 'ALIGNMENT'
 
 # --- DDP Setup ---
 def setup_ddp():
-    """Initializes the distributed process group."""
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return rank, dist.get_world_size(), local_rank
 
-# --- 2. Data Generation (Unchanged) ---
+# --- 2. Data Generation ---
 def generate_addition_transitions(num_digits, grid_h, grid_w):
     a = random.randint(10**(num_digits-1), 10**num_digits - 1); b = random.randint(10**(num_digits-1), 10**num_digits - 1); c = a + b
     board = [[' ' for _ in range(grid_w)] for _ in range(grid_h)]
@@ -52,21 +51,24 @@ def generate_alignment_transitions(seq_len, grid_h, grid_w):
     MATCH_COST = 0; MISMATCH_COST = 1; GAP_COST = 1
     seq1 = ''.join(random.choices("ACGT", k=seq_len)); seq2 = ''.join(random.choices("ACGT", k=seq_len))
     dp_table = np.zeros((len(seq2) + 1, len(seq1) + 1), dtype=int)
-    for i in range(len(seq2) + 1): dp_table[i][0] = i
-    for j in range(len(seq1) + 1): dp_table[0][j] = j
+    for i in range(len(seq2) + 1): dp_table[i, 0] = i * GAP_COST
+    for j in range(len(seq1) + 1): dp_table[0, j] = j * GAP_COST
     for i in range(1, len(seq2) + 1):
         for j in range(1, len(seq1) + 1):
             cost = MATCH_COST if seq1[j-1] == seq2[i-1] else MISMATCH_COST
             dp_table[i, j] = min(dp_table[i-1][j-1] + cost, dp_table[i-1][j] + GAP_COST, dp_table[i][j-1] + GAP_COST)
     board = [[' ' for _ in range(grid_w)] for _ in range(grid_h)]
-    for i, char in enumerate(seq1): board[0][i+2] = char
-    for i, char in enumerate(seq2): board[i+2][0] = char
+    board_offset = 1
+    for i, char in enumerate(seq1): board[0][i + board_offset + 1] = char
+    for i, char in enumerate(seq2): board[i + board_offset][0] = char
     state_transitions = []
-    for i in range(len(seq2) + 2):
-        for j in range(len(seq1) + 2):
-            if i == 0 or j == 0 or (i==1 and j==1): continue
-            prev_board = [row[:] for row in board]; board[i][j] = str(dp_table[i-1, j-1])
-            state_transitions.append((prev_board, [row[:] for row in board]))
+    for k in range(len(seq1) + len(seq2) + 1):
+        prev_board = [row[:] for row in board]
+        for i in range(k + 1):
+            j = k - i
+            if i <= len(seq2) and j <= len(seq1):
+                board[i + board_offset][j + board_offset] = str(dp_table[i, j])
+        state_transitions.append((prev_board, [row[:] for row in board]))
     return state_transitions
 
 # --- 4. Model Architecture (Unchanged) ---
@@ -127,82 +129,103 @@ class BlackboardTransformer(nn.Module):
         return self.output_head(x)
 
 # --- 5. Generic Training & Inference Functions ---
+def get_protected_mask(grid_size, task_name, task_params, device):
+    H, W = grid_size; mask = torch.zeros((H, W), dtype=torch.bool, device=device)
+    if task_name == 'ADDITION':
+        num_digits = task_params['NUM_DIGITS']
+        mask[1, :] = True
+        mask[2, 0:W - (num_digits+1)] = True
+        mask[2, W - (num_digits+1):] = True
+        mask[3, W - (num_digits+1):] = True
+    elif task_name == 'ALIGNMENT':
+        seq_len = task_params['SEQ_LEN']; board_offset = 1
+        mask[0, board_offset+1 : board_offset+1+seq_len] = True
+        mask[board_offset : board_offset+1+seq_len+1, 0] = True
+    return mask.view(1, H, W)
+
+def create_bert_loss_target(input_boards, target_boards, protected_mask, vocab_size, device):
+    corrupted_boards = input_boards.clone()
+    loss_target = torch.full_like(input_boards, -100)
+    primary_target_mask = (input_boards != target_boards)
+    loss_target[primary_target_mask] = target_boards[primary_target_mask]
+    
+    # Candidates for MLM are all non-primary cells (including protected ones)
+    candidate_mask = ~primary_target_mask
+    candidate_indices = torch.where(candidate_mask)
+    num_candidates = candidate_indices[0].size(0)
+    num_to_select = int(num_candidates * 0.30)
+    
+    if num_to_select > 0:
+        rand_indices = torch.randperm(num_candidates, device=device)[:num_to_select]
+        selected_b, selected_h, selected_w = (candidate_indices[i][rand_indices] for i in range(3))
+        
+        mlm_mask = torch.zeros_like(input_boards, dtype=torch.bool)
+        mlm_mask[selected_b, selected_h, selected_w] = True
+        loss_target[mlm_mask] = target_boards[mlm_mask]
+
+        # Of the selected MLM cells, find which ones are NOT protected and can be corrupted
+        is_protected_mask = protected_mask.expand_as(input_boards)
+        corruptible_mask = mlm_mask & ~is_protected_mask
+        corruptible_indices = torch.where(corruptible_mask)
+        
+        # Corrupt 50% of the *corruptible* subset
+        num_corruptible = corruptible_indices[0].size(0)
+        num_to_corrupt = int(num_corruptible * 0.5)
+        
+        if num_to_corrupt > 0:
+            rand_corrupt_perm = torch.randperm(num_corruptible, device=device)[:num_to_corrupt]
+            corrupt_b = corruptible_indices[0][rand_corrupt_perm]
+            corrupt_h = corruptible_indices[1][rand_corrupt_perm]
+            corrupt_w = corruptible_indices[2][rand_corrupt_perm]
+            
+            random_tokens = torch.randint(0, vocab_size, (num_to_corrupt,), device=device)
+            corrupted_boards[corrupt_b, corrupt_h, corrupt_w] = random_tokens
+            
+    return corrupted_boards, loss_target
 
 def preprocess_data_on_gpu(all_transitions, stoi_map, rank, world_size, device):
-    """Tokenizes the entire dataset and moves it to the GPU as two large tensors."""
     if rank == 0:
         if not all_transitions:
-            size_tensor = torch.tensor([0, 0, 0], dtype=torch.long, device=device)
-            dist.broadcast(size_tensor, src=0)
-            return None, None
-            
+            size_tensor = torch.tensor([0,0,0], dtype=torch.long, device=device); dist.broadcast(size_tensor, src=0); return None, None
         print("Preprocessing data on rank 0...")
-        input_list = [torch.tensor([[stoi_map[c] for c in row] for row in in_b], dtype=torch.long) for in_b, _ in all_transitions]
-        target_list = [torch.tensor([[stoi_map[c] for c in row] for row in out_b], dtype=torch.long) for _, out_b in all_transitions]
-        all_input_boards = torch.stack(input_list)
-        all_target_boards = torch.stack(target_list)
-        
-        # CORRECTED: Move the data to the GPU on rank 0 before broadcasting
-        all_input_boards = all_input_boards.to(device)
-        all_target_boards = all_target_boards.to(device)
-        print(f"Data generated on rank 0 and moved to {device}. Shape: {all_input_boards.shape}")
+        input_list = [torch.tensor([[stoi_map.get(c, 0) for c in row] for row in in_b], dtype=torch.long) for in_b, _ in all_transitions]
+        target_list = [torch.tensor([[stoi_map.get(c, 0) for c in row] for row in out_b], dtype=torch.long) for _, out_b in all_transitions]
+        all_input_boards = torch.stack(input_list).to(device); all_target_boards = torch.stack(target_list).to(device)
+        if rank == 0: print(f"Data generated on rank 0 and moved to {device}. Shape: {all_input_boards.shape}")
     
-    # All ranks create a tensor on their assigned GPU to hold the shape info
     size_tensor = torch.empty(3, dtype=torch.long, device=device)
-    
-    if rank == 0:
-        size_tensor[0], size_tensor[1], size_tensor[2] = all_input_boards.shape
-
-    # Broadcast the shape tensor from rank 0 to all other ranks
+    if rank == 0: size_tensor[0], size_tensor[1], size_tensor[2] = all_input_boards.shape
     dist.broadcast(size_tensor, src=0)
-
-    if size_tensor[0] == 0:
-        return None, None
-        
-    # Other ranks create empty tensors on their GPU to receive the data
+    if size_tensor[0] == 0: return None, None
     if rank != 0:
         all_input_boards = torch.empty(tuple(size_tensor.tolist()), dtype=torch.long, device=device)
         all_target_boards = torch.empty(tuple(size_tensor.tolist()), dtype=torch.long, device=device)
-
-    # Broadcast the actual data tensors from rank 0 to all other ranks
-    dist.broadcast(all_input_boards, src=0)
-    dist.broadcast(all_target_boards, src=0)
-
-    if rank == 0:
-        print("Data successfully broadcasted to all GPUs.")
-        
+    dist.broadcast(all_input_boards, src=0); dist.broadcast(all_target_boards, src=0)
+    if rank == 0: print("Data successfully broadcasted to all GPUs.")
     return all_input_boards, all_target_boards
 
-def run_training_loop(model, all_input_boards, all_target_boards, epochs, lr, batch_size, vocab, rank, world_size):
-    criterion = nn.CrossEntropyLoss(); optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler()
-    num_samples = all_input_boards.size(0)
-
-    if rank == 0: print("Starting DDP training with pre-loaded GPU data and Mixed Precision...")
+def run_training_loop(model, all_input_boards, all_target_boards, epochs, lr, batch_size, vocab, rank, world_size, task_name, task_params):
+    criterion = nn.CrossEntropyLoss(ignore_index=-100); optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(); num_samples = all_input_boards.size(0)
+    protected_mask = get_protected_mask((all_input_boards.shape[1], all_input_boards.shape[2]), task_name, task_params, all_input_boards.device)
+    if rank == 0: print("Starting DDP training with BERT-style MLM loss...")
     start_time = time.time()
     for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-        # Manual data sharding for DDP
+        model.train(); total_loss = 0
         indices = torch.randperm(num_samples); rank_indices = indices[rank::world_size]
-        
         for i in range(0, len(rank_indices), batch_size):
             batch_indices = rank_indices[i:i+batch_size]
             input_boards = all_input_boards[batch_indices]; target_boards = all_target_boards[batch_indices]
-            
+            corrupted_boards, loss_target = create_bert_loss_target(input_boards, target_boards, protected_mask, len(vocab), input_boards.device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast():
-                logits = model(input_boards)
-                loss = criterion(logits.view(-1, len(vocab)), target_boards.view(-1))
-            
-            scaler.scale(loss).backward()
-            scaler.step(optimizer); scaler.update()
+            with torch.amp.autocast(device_type='cuda'):
+                logits = model(corrupted_boards)
+                loss = criterion(logits.view(-1, len(vocab)), loss_target.view(-1))
+            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
             total_loss += loss.item()
-        
-        avg_loss = total_loss / (len(rank_indices) / batch_size)
+        avg_loss = total_loss / (len(rank_indices) / batch_size) if len(rank_indices) > 0 else 0
         if rank == 0: print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
-    
-    dist.barrier() # Wait for all processes to finish training
+    dist.barrier()
     if rank == 0: print(f"Training finished in {time.time() - start_time:.2f} seconds.")
 
 def infer_addition(model, num_digits, grid_size, stoi, itos, device):
@@ -218,8 +241,8 @@ def infer_addition(model, num_digits, grid_size, stoi, itos, device):
     print("--- Initial Problem ---"); print("\n".join("".join(row) for row in board))
     with torch.no_grad():
         for step in range(num_digits * 2 + 2):
-            board_tensor = torch.tensor([[stoi[c] for c in row] for row in board], dtype=torch.long).unsqueeze(0).to(device)
-            logits = model(board_tensor)
+            board_tensor = torch.tensor([[stoi.get(c, 0) for c in row] for row in board], dtype=torch.long).unsqueeze(0).to(device)
+            with torch.amp.autocast(device_type='cuda'): logits = model(board_tensor)
             predictions = logits.argmax(dim=-1).view(1, grid_size[0], grid_size[1])
             new_board = [[itos[p.item()] for p in row] for row in predictions[0]]
             if new_board == board: print("\nModel has converged."); break
@@ -230,13 +253,14 @@ def infer_alignment(model, seq_len, grid_size, stoi, itos, device):
     model.eval()
     seq1 = ''.join(random.choices("ACGT", k=seq_len)); seq2 = ''.join(random.choices("ACGT", k=seq_len))
     board = [[' ' for _ in range(grid_size[1])] for _ in range(grid_size[0])]
-    for i, char in enumerate(seq1): board[0][i+2] = char
-    for i, char in enumerate(seq2): board[i+2][0] = char
+    board_offset = 1
+    for i, char in enumerate(seq1): board[0][i+board_offset+1] = char
+    for i, char in enumerate(seq2): board[i+board_offset][0] = char
     print("--- Initial Problem ---"); print(f"Seq1: {seq1}\nSeq2: {seq2}"); print("\n".join("".join(row) for row in board))
     with torch.no_grad():
-        for step in range((seq_len+2)**2):
-            board_tensor = torch.tensor([[stoi[c] for c in row] for row in board], dtype=torch.long).unsqueeze(0).to(device)
-            logits = model(board_tensor)
+        for step in range((seq_len+1)**2 + 1):
+            board_tensor = torch.tensor([[stoi.get(c, 0) for c in row] for row in board], dtype=torch.long).unsqueeze(0).to(device)
+            with torch.amp.autocast(device_type='cuda'): logits = model(board_tensor)
             predictions = logits.argmax(dim=-1).view(1, grid_size[0], grid_size[1])
             new_board = [[itos[p.item()] for p in row] for row in predictions[0]]
             if new_board == board: print("\nModel has converged."); break
@@ -244,25 +268,21 @@ def infer_alignment(model, seq_len, grid_size, stoi, itos, device):
     print("\n--- Final Board State ---"); print("\n".join("".join(row) for row in board))
 
 # --- 6. Task-Specific Training Orchestration ---
-
 def setup_and_train_addition(rank, world_size, local_rank, device):
     if rank == 0: print("--- CONFIGURING FOR ADDITION TASK ---")
     VOCAB = list("0123456789+- ="); stoi = {c: i for i, c in enumerate(VOCAB)}; itos = {i: c for i, c in enumerate(VOCAB)}
-    GRID_SIZE = (5, 8); NUM_DIGITS = 3; D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
+    NUM_DIGITS=3; GRID_SIZE = (5, 8); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
     BATCH_SIZE = 128; LEARNING_RATE = 1e-4; NUM_EPOCHS = 20; NUM_SAMPLES = 8000
-    
+    task_params = {'NUM_DIGITS': NUM_DIGITS}
     all_transitions = []
     if rank == 0:
         print("Generating training data on rank 0...")
         for _ in range(NUM_SAMPLES): all_transitions.extend(generate_addition_transitions(NUM_DIGITS, GRID_SIZE[0], GRID_SIZE[1]))
-    
     all_input_gpu, all_target_gpu = preprocess_data_on_gpu(all_transitions, stoi, rank, world_size, device)
-    
+    if all_input_gpu is None: return
     model = BlackboardTransformer(len(VOCAB), D_MODEL, NHEAD, NUM_LAYERS, GRID_SIZE, pe_type='ROPE').to(device)
     model = DDP(model, device_ids=[local_rank])
-    
-    run_training_loop(model, all_input_gpu, all_target_gpu, NUM_EPOCHS, LEARNING_RATE, BATCH_SIZE, VOCAB, rank, world_size)
-
+    run_training_loop(model, all_input_gpu, all_target_gpu, NUM_EPOCHS, LEARNING_RATE, BATCH_SIZE, VOCAB, rank, world_size, 'ADDITION', task_params)
     if rank == 0:
         print("\n--- Running Addition Inference ---"); infer_addition(model.module, NUM_DIGITS, GRID_SIZE, stoi, itos, device)
         print("\n--- Running Addition Generalization ---"); infer_addition(model.module, NUM_DIGITS + 1, GRID_SIZE, stoi, itos, device)
@@ -270,35 +290,30 @@ def setup_and_train_addition(rank, world_size, local_rank, device):
 def setup_and_train_alignment(rank, world_size, local_rank, device):
     if rank == 0: print("--- CONFIGURING FOR ALIGNMENT TASK ---")
     VOCAB = list("ACGT0123456789-=") + [' ']; stoi = {c: i for i, c in enumerate(VOCAB)}; itos = {i: c for i, c in enumerate(VOCAB)}
-    SEQ_LEN = 5; GRID_SIZE = (SEQ_LEN + 3, SEQ_LEN + 3); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
-    BATCH_SIZE = 512; LEARNING_RATE = 1e-3; NUM_EPOCHS = 20; NUM_SAMPLES = 20000
-    
+    SEQ_LEN = 8; GRID_SIZE = (SEQ_LEN + 3, SEQ_LEN + 3); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
+    BATCH_SIZE = 512; LEARNING_RATE = 1e-3; NUM_EPOCHS = 30; NUM_SAMPLES = 20000
+    task_params = {'SEQ_LEN': SEQ_LEN}
     all_transitions = []
     if rank == 0:
         print("Generating training data on rank 0...")
         for _ in range(NUM_SAMPLES): all_transitions.extend(generate_alignment_transitions(SEQ_LEN, GRID_SIZE[0], GRID_SIZE[1]))
-
     all_input_gpu, all_target_gpu = preprocess_data_on_gpu(all_transitions, stoi, rank, world_size, device)
-
+    if all_input_gpu is None: return
     model = BlackboardTransformer(len(VOCAB), D_MODEL, NHEAD, NUM_LAYERS, GRID_SIZE, pe_type='ROPE').to(device)
     model = DDP(model, device_ids=[local_rank])
-
-    run_training_loop(model, all_input_gpu, all_target_gpu, NUM_EPOCHS, LEARNING_RATE, BATCH_SIZE, VOCAB, rank, world_size)
-
+    run_training_loop(model, all_input_gpu, all_target_gpu, NUM_EPOCHS, LEARNING_RATE, BATCH_SIZE, VOCAB, rank, world_size, 'ALIGNMENT', task_params)
     if rank == 0:
         print("\n--- Running Alignment Inference ---"); infer_alignment(model.module, SEQ_LEN, GRID_SIZE, stoi, itos, device)
 
 def main():
     rank, world_size, local_rank = setup_ddp()
     device = f'cuda:{local_rank}'
-
     if TASK == 'ADDITION':
         setup_and_train_addition(rank, world_size, local_rank, device)
     elif TASK == 'ALIGNMENT':
         setup_and_train_alignment(rank, world_size, local_rank, device)
     else:
         raise ValueError(f"Unknown TASK specified: {TASK}")
-    
     dist.destroy_process_group()
 
 if __name__ == '__main__':
