@@ -274,8 +274,8 @@ def setup_and_train_addition(rank, world_size, local_rank, device):
 def setup_and_train_alignment(rank, world_size, local_rank, device):
     if rank == 0: print("--- CONFIGURING FOR ALIGNMENT TASK ---")
     VOCAB = list("ACGT0123456789-=") + [' ']; stoi = {c: i for i, c in enumerate(VOCAB)}; itos = {i: c for i, c in enumerate(VOCAB)}
-    SEQ_LEN = 8; GRID_SIZE = (SEQ_LEN + 3, SEQ_LEN + 3); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
-    BATCH_SIZE = 512; LEARNING_RATE = 1e-3; NUM_EPOCHS = 30; NUM_SAMPLES = 20000
+    SEQ_LEN = 9; GRID_SIZE = (SEQ_LEN + 3, SEQ_LEN + 3); D_MODEL = 128; NHEAD = 8; NUM_LAYERS = 6
+    BATCH_SIZE = 1024; LEARNING_RATE = 1e-3; NUM_EPOCHS = 50; NUM_SAMPLES = 20000
     task_params = {'SEQ_LEN': SEQ_LEN}
     all_transitions = []
     if rank == 0:
