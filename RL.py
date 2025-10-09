@@ -12,7 +12,7 @@ GRID_SIZE = 8
 D_MODEL = 128
 NHEAD = 4
 NUM_LAYERS = 4
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 1e-4
 TOTAL_TIMESTEPS = 2_000_000
 NUM_ENVS = 64
 STEPS_PER_UPDATE = 64
@@ -76,21 +76,34 @@ class VectorizedGridWorldEnv:
         return self.get_state(), rewards, dones
 
     def _reset_envs(self, done_mask):
+        """Resets specific environments based on a boolean mask using vectorized operations."""
         num_to_reset = done_mask.sum().item()
         if num_to_reset == 0: return
         
+        # Clear the grids for the environments that are done
         self.grids[done_mask] = torch.full((self.grid_size, self.grid_size), stoi[' '], device=self.device)
-        for _ in range(self.grid_size * 2):
-            coords = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
-            self.grids[done_mask, coords[:, 0], coords[:, 1]] = stoi['#']
         
+        # --- VECTORIZED WALL PLACEMENT ---
+        # 1. Determine the number of walls to place in each resetting environment
+        num_walls = int(self.grid_size * 1.5)
+        
+        # 2. Generate all random coordinates at once
+        # Shape: (num_to_reset, num_walls, 2) -> (x,y) coords for each wall in each env
+        wall_coords = torch.randint(0, self.grid_size, (num_to_reset, num_walls, 2), device=self.device)
+        
+        # 3. Get the indices of the environments that need resetting
+        env_indices = torch.where(done_mask)[0]
+        
+        # 4. Use advanced indexing to place all walls in one operation
+        # We need to repeat the env_indices to match the shape of the wall coordinates
+        self.grids[env_indices.view(-1, 1), wall_coords[..., 0], wall_coords[..., 1]] = stoi['#']
+        # --- END OF VECTORIZATION ---
+        
+        # The rest of the reset logic is already vectorized
         self.agent_pos[done_mask] = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
         self.end_pos[done_mask] = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
         
-        # Get the global indices for environments that are done
-        # CORRECTED: Create the arange tensor on the correct device
-        env_indices = torch.arange(self.num_envs, device=self.device)[done_mask]
-
+        # Ensure S and E are not placed on the new walls
         self.grids[env_indices, self.agent_pos[done_mask, 0], self.agent_pos[done_mask, 1]] = stoi['S']
         self.grids[env_indices, self.end_pos[done_mask, 0], self.end_pos[done_mask, 1]] = stoi['E']
 
