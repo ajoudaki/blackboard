@@ -14,7 +14,7 @@ NHEAD = 4
 NUM_LAYERS = 4
 LEARNING_RATE = 3e-4
 TOTAL_TIMESTEPS = 2_000_000
-NUM_ENVS = 64
+NUM_ENVS = 128
 STEPS_PER_UPDATE = 64
 GAMMA = 0.99
 
@@ -180,22 +180,40 @@ def run_rl_training(policy_model, env, num_updates, steps_per_update, lr, gamma)
             print(f"Update {update}, Avg Reward (last 100 episodes): {avg_reward:.2f}")
     print("Training finished.")
 
-# --- 5. Inference Function ---
+
 def infer(policy_model, env, stoi, itos):
+    """Runs inference on a single environment instance using the VectorizedEnv."""
     print("\n--- Running Inference on a single environment ---")
+    
     single_env = VectorizedGridWorldEnv(num_envs=1, grid_size=env.grid_size, device=env.device)
-    state = single_env.reset(); done = False; step = 0; max_steps = env.grid_size * 4
+    state = single_env.reset()
+    done = torch.tensor([False], device=env.device)
+    step = 0
+    max_steps = env.grid_size * 4
+    
     while not done.any() and step < max_steps:
+        # CORRECTED: Call .cpu() before converting to numpy for printing
         state_np = state.cpu().numpy()[0]
-        print(f"\nStep {step+1}"); print("\n".join("".join([itos[c] for c in row]) for row in state_np))
-        with torch.no_grad(): action_probs = policy_model(state)
+        print(f"\nStep {step+1}")
+        print("\n".join("".join([itos[c] for c in row]) for row in state_np))
+
+        with torch.no_grad():
+            action_probs = policy_model(state)
+        
         action = torch.argmax(action_probs, dim=-1)
+        
         state, _, done = single_env.step(action)
         step += 1
+    
+    # CORRECTED: Call .cpu() before converting the final state to numpy
     state_np = state.cpu().numpy()[0]
-    print("\nFinal Board State:"); print("\n".join("".join([itos[c] for c in row]) for row in state_np))
-    if done.any(): print("\nSuccess! Agent reached the exit.")
-    else: print("\nFailure. Agent did not reach the exit.")
+    print("\nFinal Board State:")
+    print("\n".join("".join([itos[c] for c in row]) for row in state_np))
+    
+    if done.any():
+        print("\nSuccess! Agent reached the exit.")
+    else:
+        print("\nFailure. Agent did not reach the exit in time.")
 
 # --- 6. Main Execution Block ---
 if __name__ == '__main__':
