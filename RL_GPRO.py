@@ -6,27 +6,24 @@ import time
 from collections import deque
 
 # --- 1. Configuration ---
-GRID_SIZE = 10
+GRID_SIZE = 12
 D_MODEL = 128
 NHEAD = 4
 NUM_LAYERS = 4
-LEARNING_RATE = 3e-4
-TOTAL_TIMESTEPS = 1_000_000
+LEARNING_RATE = 1e-4
+TOTAL_TIMESTEPS = 400_000
 NUM_ENVS = 64          # For training
 STEPS_PER_UPDATE = 64  # For training
 MAX_EPISODE_STEPS = GRID_SIZE * 4 # Max steps per episode
-STEP_REWARD = -0.01
-INVALID_REWARD = -0.2
-GOAL_REWARD = 1
 
-# PPO-specific hyperparameters
+# GRPO-specific hyperparameters
 GAMMA = 0.99
 GAE_LAMBDA = 0.95
-CLIP_EPS = 0.2
 EPOCHS_PER_UPDATE = 10
 MINIBATCH_SIZE = 256
 VALUE_COEF = 0.5
 ENTROPY_COEF = 0.01
+GRPO_BETA = 0.1  # Temperature parameter for GRPO objective
 
 # Evaluation settings
 LOG_INTERVAL = 10    # Print logs every 10 updates
@@ -47,7 +44,7 @@ class VectorizedGridWorldEnv:
         self.action_space = 4
         self.grids = torch.full((num_envs, grid_size, grid_size), stoi[' '], dtype=torch.long, device=device)
         self.agent_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=device)
-        self.start_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=device)  # NEW: Track start positions
+        self.start_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=device)
         self.end_pos = torch.zeros((num_envs, 2), dtype=torch.long, device=device)
         self.episode_steps = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.max_steps = MAX_EPISODE_STEPS
@@ -57,22 +54,15 @@ class VectorizedGridWorldEnv:
         return self.get_state()
     
     def get_state(self):
-        # Start with the base grid of walls and spaces
         state = self.grids.clone()
-        
-        # Clear any existing S, E, or A characters before drawing new ones
         state[(state == stoi['S']) | (state == stoi['E']) | (state == stoi['A'])] = stoi[' ']
         
-        # Add 'S' marker at start position (only if agent has moved away from start)
         agent_not_at_start = (self.agent_pos[:, 0] != self.start_pos[:, 0]) | (self.agent_pos[:, 1] != self.start_pos[:, 1])
         if agent_not_at_start.any():
             valid_envs = torch.where(agent_not_at_start)[0]
             state[valid_envs, self.start_pos[valid_envs, 0], self.start_pos[valid_envs, 1]] = stoi['S']
         
-        # Add 'E' marker at end position
         state[torch.arange(self.num_envs, device=self.device), self.end_pos[:, 0], self.end_pos[:, 1]] = stoi['E']
-        
-        # Add 'A' marker at agent position (overwrites S or E if agent is on them)
         state[torch.arange(self.num_envs, device=self.device), self.agent_pos[:, 0], self.agent_pos[:, 1]] = stoi['A']
         
         return state
@@ -95,11 +85,11 @@ class VectorizedGridWorldEnv:
         invalid_moves = out_of_bounds | wall_collisions
         self.agent_pos[~invalid_moves] = next_pos[~invalid_moves]
         
-        rewards = torch.full((self.num_envs,), STEP_REWARD, device=self.device, dtype=torch.float)
-        rewards[invalid_moves] = INVALID_REWARD
+        rewards = torch.full((self.num_envs,), -0.01, device=self.device, dtype=torch.float)
+        rewards[invalid_moves] = -0.1
         
         goal_reached = (self.agent_pos[:, 0] == self.end_pos[:, 0]) & (self.agent_pos[:, 1] == self.end_pos[:, 1])
-        rewards[goal_reached] = GOAL_REWARD
+        rewards[goal_reached] = 1.0
         
         timeout = self.episode_steps >= self.max_steps
         dones = goal_reached | timeout
@@ -117,17 +107,14 @@ class VectorizedGridWorldEnv:
         self.episode_steps[done_mask] = 0
         self.grids[done_mask] = torch.full((self.grid_size, self.grid_size), stoi[' '], device=self.device)
         
-        # Add random walls
         for _ in range(int(self.grid_size * 1.5)):
             coords = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
             self.grids[done_mask, coords[:, 0], coords[:, 1]] = stoi['#']
         
-        # Set start and end positions
         self.agent_pos[done_mask] = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
-        self.start_pos[done_mask] = self.agent_pos[done_mask].clone()  # NEW: Save start position
+        self.start_pos[done_mask] = self.agent_pos[done_mask].clone()
         self.end_pos[done_mask] = torch.randint(0, self.grid_size, (num_to_reset, 2), device=self.device)
         
-        # Mark start and end in the grid
         env_indices = torch.arange(self.num_envs, device=self.device)[done_mask]
         self.grids[env_indices, self.agent_pos[done_mask, 0], self.agent_pos[done_mask, 1]] = stoi['S']
         self.grids[env_indices, self.end_pos[done_mask, 0], self.end_pos[done_mask, 1]] = stoi['E']
@@ -202,7 +189,6 @@ def evaluate_agent(agent, grid_size, device, num_episodes=256):
     states = eval_env.reset()
     
     episode_lengths = torch.zeros(num_episodes, device=device)
-    # This flag is now crucial to prevent double-counting
     active_episodes = torch.ones(num_episodes, device=device, dtype=torch.bool)
     
     successes = 0
@@ -218,11 +204,8 @@ def evaluate_agent(agent, grid_size, device, num_episodes=256):
         
         states, _, dones, terminals = eval_env.step(actions)
         
-        # Only increment lengths for episodes that are still running
         episode_lengths[active_episodes] += 1
         
-        # --- THIS IS THE FIX ---
-        # Only consider successes from episodes that are still marked as active
         newly_finished = torch.where(terminals & active_episodes)[0]
 
         if len(newly_finished) > 0:
@@ -237,12 +220,10 @@ def evaluate_agent(agent, grid_size, device, num_episodes=256):
                 total_path_length += path_len
                 total_shortest_path += shortest_path if shortest_path > 0 else 1
             
-            # Mark these episodes as inactive so they can't be counted again
             active_episodes[newly_finished] = False
-        # --- END OF FIX ---
 
         if not active_episodes.any():
-            break # All episodes finished
+            break
 
     avg_success_rate = (successes / num_episodes) * 100
     avg_success_len = total_path_length / successes if successes > 0 else float('nan')
@@ -254,8 +235,16 @@ def evaluate_agent(agent, grid_size, device, num_episodes=256):
         "avg_efficiency": avg_efficiency
     }
 
-# --- 5. PPO Training Loop with Combined Logging ---
-def run_ppo_training(agent, env):
+# --- 5. GRPO Training Loop ---
+def run_grpo_training(agent, env):
+    """
+    GRPO (Group Relative Policy Optimization) training.
+    
+    Key differences from PPO:
+    1. Uses group-relative advantage comparisons within minibatches
+    2. No clipping - uses a softer objective based on relative performance
+    3. Explicitly encourages actions with higher relative advantages
+    """
     optimizer = optim.AdamW(agent.parameters(), lr=LEARNING_RATE, eps=1e-5)
     num_updates = TOTAL_TIMESTEPS // (NUM_ENVS * STEPS_PER_UPDATE)
     
@@ -267,14 +256,14 @@ def run_ppo_training(agent, env):
     values = torch.zeros((STEPS_PER_UPDATE, NUM_ENVS), device=device)
     terminals = torch.zeros((STEPS_PER_UPDATE, NUM_ENVS), device=device)
 
-    print("Starting PPO Training...")
+    print("Starting GRPO Training...")
     global_step = 0
     next_state = env.reset()
     next_done = torch.zeros(NUM_ENVS, device=device)
     next_terminal = torch.zeros(NUM_ENVS, device=device)
 
     for update in range(1, num_updates + 1):
-        # --- Collect Rollout ---
+        # --- Collect Rollout (Same as PPO) ---
         for step in range(STEPS_PER_UPDATE):
             global_step += NUM_ENVS
             states[step], dones[step] = next_state, next_done
@@ -285,7 +274,7 @@ def run_ppo_training(agent, env):
             next_state, reward, next_done, next_terminal = env.step(action)
             rewards[step], terminals[step] = reward, next_terminal
 
-        # --- GAE Calculation ---
+        # --- GAE Calculation (Same as PPO) ---
         with torch.no_grad():
             next_value = agent.get_action_and_value(next_state)[3].reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
@@ -301,13 +290,12 @@ def run_ppo_training(agent, env):
                 advantages[t] = last_gae_lam = delta + GAMMA * GAE_LAMBDA * next_non_terminal * last_gae_lam
             returns = advantages + values
 
-        # --- PPO Update ---
+        # --- GRPO Update (Different from PPO) ---
         b_states = states.reshape((-1, GRID_SIZE, GRID_SIZE))
         b_actions, b_log_probs = actions.reshape(-1), log_probs.reshape(-1)
         b_advantages, b_returns = advantages.reshape(-1), returns.reshape(-1)
         b_inds = np.arange(NUM_ENVS * STEPS_PER_UPDATE)
         
-        # Trackers for training diagnostics
         pg_losses, v_losses, entropy_losses = [], [], []
 
         for epoch in range(EPOCHS_PER_UPDATE):
@@ -315,46 +303,63 @@ def run_ppo_training(agent, env):
             for start in range(0, NUM_ENVS * STEPS_PER_UPDATE, MINIBATCH_SIZE):
                 end = start + MINIBATCH_SIZE
                 mb_inds = b_inds[start:end]
+                
                 _, new_log_prob, entropy, new_value = agent.get_action_and_value(b_states[mb_inds], b_actions[mb_inds])
+                
+                # --- GRPO OBJECTIVE ---
+                # 1. Compute group-relative advantages
+                mb_advantages = b_advantages[mb_inds]
+                group_mean = mb_advantages.mean()
+                group_std = mb_advantages.std() + 1e-8
+                relative_advantages = (mb_advantages - group_mean) / group_std
+                
+                # 2. Compute importance ratio
                 log_ratio = new_log_prob - b_log_probs[mb_inds]
                 ratio = torch.exp(log_ratio)
-                mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                
+                # 3. GRPO loss: weighted by relative advantages with a soft constraint
+                # Instead of clipping, we use a KL-regularized objective
+                # This encourages the policy to improve actions with high relative advantages
+                # while staying close to the old policy
+                pg_loss = -(relative_advantages * ratio - GRPO_BETA * (ratio - 1)**2).mean()
+                
+                # Alternative GRPO formulation (comment out the above and use this if you prefer):
+                # This version uses a margin-based approach
+                # pg_loss = -(relative_advantages * ratio).mean() + GRPO_BETA * (ratio.log()**2).mean()
+                
+                # Value and entropy losses (same as PPO)
                 v_loss = 0.5 * ((new_value.view(-1) - b_returns[mb_inds]) ** 2).mean()
                 entropy_loss = entropy.mean()
+                
+                # Combined loss
                 loss = pg_loss - ENTROPY_COEF * entropy_loss + VALUE_COEF * v_loss
+                
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
                 optimizer.step()
-                # Append diagnostics
+                
                 pg_losses.append(pg_loss.item())
                 v_losses.append(v_loss.item())
                 entropy_losses.append(entropy_loss.item())
 
-        # --- Combined Logging ---
+        # --- Logging ---
         if update % LOG_INTERVAL == 0:
             print(f"--- Update {update}, Global Step: {global_step} ---")
-            
-            # Print training diagnostics every time
             print(f"  Training Diagnostics:")
             print(f"    Policy Loss: {np.mean(pg_losses):.4f}, Value Loss: {np.mean(v_losses):.4f}, Entropy: {np.mean(entropy_losses):.4f}")
             
-            # Run and print validation performance periodically
             if update % EVAL_INTERVAL == 0:
                 eval_metrics = evaluate_agent(agent, GRID_SIZE, device, num_episodes=EVAL_EPISODES)
                 print(f"  Validation Performance:")
                 print(f"    Success Rate:        {eval_metrics['success_rate']:.1f}%")
                 print(f"    Avg Success Length:  {eval_metrics['avg_len']:.1f} steps")
                 print(f"    Avg Efficiency:      {eval_metrics['avg_efficiency']:.2f} (actual/shortest)")
-            print() # Add a newline for spacing
+            print()
 
     print("Training finished.")
 
-# --- 6. Inference Function (FIXED) ---
+# --- 6. Inference Function ---
 def infer(policy_model, env, stoi, itos):
     print("\n--- Running Inference on a single environment ---")
     single_env = VectorizedGridWorldEnv(num_envs=1, grid_size=env.grid_size, device=env.device)
@@ -369,7 +374,6 @@ def infer(policy_model, env, stoi, itos):
         with torch.no_grad():
             action, _, _, _ = policy_model.get_action_and_value(state, deterministic=True)
         
-        # Capture goal_reached BEFORE environment resets
         state, reward, done, goal_reached = single_env.step(action)
         
         if goal_reached.any():
@@ -389,5 +393,5 @@ if __name__ == '__main__':
         vocab_size=len(VOCAB), d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS,
         grid_size=(GRID_SIZE, GRID_SIZE), num_actions=env.action_space
     ).to(device)
-    run_ppo_training(agent, env)
+    run_grpo_training(agent, env)
     infer(agent, env, stoi, itos)
