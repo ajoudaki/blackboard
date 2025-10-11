@@ -10,32 +10,24 @@ import time
 # ============================================================================
 CONFIG = {
     'shared': {
-        'grid_size': 8, # Smaller grid for faster training
-        'vocab': [' ', '#', 'S', 'E', 'A'],
-        'num_actions': 4,
+        'grid_size': 8, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 4,
     },
     'env': {
-        'wall_density': 1.2,
-        'max_episode_steps_multiplier': 5,
+        'wall_density': 1.2, 'max_episode_steps_multiplier': 5,
         'reward_step': -0.01, 'reward_collision': -0.1, 'reward_goal': 1.0,
     },
     'model': {
         'd_model': 128, 'nhead': 4, 'num_layers': 6,
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
-    # Phase 1: Teach the model to perform BFS
     'bfs_prediction': {
-        'total_steps': 500_000,
-        'batch_size': 32,
-        'learning_rate': 1e-3,
+        'total_steps': 500_000, 'batch_size': 32, 'learning_rate': 1e-3,
+        'val_interval': 100, # Run validation every 100 training steps
     },
-    # Phase 2: Teach the agent to use its learned BFS skill
     'rl_navigation': {
-        'total_timesteps': 300_000,
-        'num_envs': 64, 'steps_per_update': 64,
+        'total_timesteps': 300_000, 'num_envs': 64, 'steps_per_update': 64,
         'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
-        'epochs_per_update': 10, 'minibatch_size': 128,
-        'thinking_steps': 8, # How many steps the agent "thinks" before acting
+        'epochs_per_update': 10, 'minibatch_size': 128, 'thinking_steps': 8,
     },
     'grpo': {
         'gamma': 0.99, 'gae_lambda': 0.95, 'grpo_beta': 0.1,
@@ -46,70 +38,35 @@ CONFIG = {
     }
 }
 
-def get_char_mappings(vocab):
-    """Create character to index and index to character mappings."""
-    return {c: i for i, c in enumerate(vocab)}, {i: c for i, c in enumerate(vocab)}
-
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}\n")
 
-# Vocab for BFS scratchpad (distances 0-99)
-BFS_VOCAB = [str(i) for i in range(100)] + ['INF', 'UKN'] # INF for walls, UKN for unvisited
-bfs_stoi = {c: i for i, c in enumerate(BFS_VOCAB)}
-bfs_itos = {i: c for i, c in enumerate(BFS_VOCAB)}
-
-# Main vocab
+# Vocabs
+BFS_VOCAB = [str(i) for i in range(100)] + ['INF', 'UKN']
+bfs_stoi = {c: i for i, c in enumerate(BFS_VOCAB)}; bfs_itos = {i: c for i, c in enumerate(BFS_VOCAB)}
+def get_char_mappings(vocab): return {c: i for i, c in enumerate(vocab)}, {i: c for i, c in enumerate(vocab)}
 stoi, itos = get_char_mappings(CONFIG['shared']['vocab'])
 
 # ============================================================================
-# Data Generation for Phase 1 (Learning BFS)
+# Data Generation & Environment (Unchanged)
 # ============================================================================
 def generate_bfs_transitions(grids, goals):
-    num_envs, grid_size, _ = grids.shape
-    transitions = []
-    
-    # Initial state: observation grid + empty scratchpad
-    obs_channel = grids.clone()
-    scratch_channel = torch.full_like(obs_channel, bfs_stoi['UKN'])
-    
-    # Set goal distance to 0
-    env_idx = torch.arange(num_envs, device=device)
-    scratch_channel[env_idx, goals[:, 0], goals[:, 1]] = bfs_stoi['0']
-    
-    # Mark walls as INF
+    num_envs, grid_size, _ = grids.shape; transitions = []
+    obs_channel = grids.clone(); scratch_channel = torch.full_like(obs_channel, bfs_stoi['UKN'])
+    env_idx = torch.arange(num_envs, device=device); scratch_channel[env_idx, goals[:, 0], goals[:, 1]] = bfs_stoi['0']
     scratch_channel[obs_channel == stoi['#']] = bfs_stoi['INF']
-    
-    current_dist = 0
-    max_dist = grid_size * grid_size
-
-    for k in range(max_dist):
-        prev_scratch = scratch_channel.clone()
-        input_board = torch.stack([obs_channel, prev_scratch], dim=1)
-        
-        # Find all cells with the current distance
+    for k in range(grid_size * grid_size):
+        prev_scratch = scratch_channel.clone(); input_board = torch.stack([obs_channel, prev_scratch], dim=1)
         frontier = (scratch_channel == bfs_stoi[str(k)])
-        if not frontier.any(): break # No more cells to expand
-            
-        # Expand to neighbors
+        if not frontier.any(): break
         for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            # Shift the frontier mask
             next_frontier = torch.roll(frontier, shifts=(-dr, -dc), dims=(1, 2))
-            # Find neighbors that are currently unvisited ('UKN')
             updatable = (scratch_channel == bfs_stoi['UKN']) & next_frontier
             scratch_channel[updatable] = bfs_stoi[str(k + 1)]
-
         target_board = torch.stack([obs_channel, scratch_channel.clone()], dim=1)
-        
-        # Only add transitions where something actually changed
-        if not torch.equal(input_board, target_board):
-            transitions.append((input_board, target_board))
-            
+        if not torch.equal(input_board, target_board): transitions.append((input_board, target_board))
     return transitions
 
-# ============================================================================
-# Environment (Unchanged)
-# ============================================================================
 class VectorizedGridWorldEnv:
     def __init__(self, num_envs, device, **kwargs):
         self.num_envs=num_envs; self.device=device; self.grid_size=kwargs['grid_size']; self.wall_density=kwargs['wall_density']; self.max_steps=kwargs['grid_size']*kwargs['max_episode_steps_multiplier']
@@ -144,7 +101,6 @@ class VectorizedGridWorldEnv:
 # ============================================================================
 # Model Architecture (Unified with 3 Heads)
 # ============================================================================
-# (RoPE and Transformer Encoder Layer are unchanged)
 class RotaryPositionalEmbedding2D(nn.Module):
     def __init__(self,d_model,grid_size,rope_theta):
         super().__init__();self.d_row=d_model//2;self.d_col=d_model-self.d_row
@@ -169,142 +125,123 @@ class RoPETransformerEncoderLayer(nn.TransformerEncoderLayer):
 
 class UnifiedModel(nn.Module):
     def __init__(self, **model_config):
-        super().__init__()
-        self.grid_size = model_config['grid_size']
-        d_model = model_config['d_model']
-        dim_feedforward = d_model * model_config['dim_feedforward_multiplier']
-        
-        # Embeddings for the 2 input channels
-        self.obs_embedding = nn.Embedding(len(model_config['vocab']), d_model)
-        self.scratch_embedding = nn.Embedding(len(BFS_VOCAB), d_model)
-        self.channel_embedding = nn.Embedding(2, d_model) # 0 for obs, 1 for scratch
-        
-        # Core Transformer
-        self.rope = RotaryPositionalEmbedding2D(d_model, self.grid_size, model_config['rope_theta'])
-        encoder_layer = RoPETransformerEncoderLayer(d_model, model_config['nhead'], dim_feedforward, model_config['dropout'], batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, model_config['num_layers'])
-        
-        # Heads for different tasks
-        self.bfs_head = nn.Linear(d_model, len(BFS_VOCAB))
-        self.actor_head = nn.Linear(d_model, model_config['num_actions'])
-        self.critic_head = nn.Linear(d_model, 1)
-
-    def _get_base_output(self, dual_channel_board):
-        B, C, H, W = dual_channel_board.shape
-        
-        # Get embeddings for each channel
-        obs_emb = self.obs_embedding(dual_channel_board[:, 0, :, :].view(B, -1))
-        scratch_emb = self.scratch_embedding(dual_channel_board[:, 1, :, :].view(B, -1))
-        
-        # Add channel-specific embeddings
-        obs_emb += self.channel_embedding(torch.zeros_like(dual_channel_board[:, 0, :, :].view(B, -1)))
-        scratch_emb += self.channel_embedding(torch.ones_like(dual_channel_board[:, 1, :, :].view(B, -1)))
-        
-        # Combine embeddings and apply Transformer
-        x = torch.cat([obs_emb, scratch_emb], dim=1) # Concatenate along sequence dim
-        
-        # Create position IDs for the combined 2*H*W sequence
-        rows = torch.arange(H, device=device).view(1,H,1).expand(B,H,W)
-        cols = torch.arange(W, device=device).view(1,1,W).expand(B,H,W)
-        pos_ids_single = torch.stack([rows,cols],dim=-1).view(B,H*W,2)
-        pos_ids = torch.cat([pos_ids_single, pos_ids_single], dim=1) # Repeat for both channels
-        
-        for layer in self.transformer.layers:
-            x = layer(x, pos_ids=pos_ids, rope=self.rope)
-        
+        super().__init__(); self.grid_size=model_config['grid_size']; d_model=model_config['d_model']; dim_feedforward=d_model*model_config['dim_feedforward_multiplier']
+        self.obs_embedding=nn.Embedding(len(model_config['vocab']),d_model); self.scratch_embedding=nn.Embedding(len(BFS_VOCAB),d_model); self.channel_embedding=nn.Embedding(2,d_model)
+        self.rope=RotaryPositionalEmbedding2D(d_model,self.grid_size,model_config['rope_theta']); encoder_layer=RoPETransformerEncoderLayer(d_model,model_config['nhead'],dim_feedforward,model_config['dropout'],batch_first=True); self.transformer=nn.TransformerEncoder(encoder_layer,model_config['num_layers'])
+        self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB)); self.actor_head=nn.Linear(d_model,model_config['num_actions']); self.critic_head=nn.Linear(d_model,1)
+    def _get_base_output(self,dual_channel_board):
+        B,C,H,W=dual_channel_board.shape
+        obs_emb=self.obs_embedding(dual_channel_board[:,0,:,:].view(B,-1)); scratch_emb=self.scratch_embedding(dual_channel_board[:,1,:,:].view(B,-1))
+        obs_emb+=self.channel_embedding(torch.zeros_like(dual_channel_board[:,0,:,:].view(B,-1))); scratch_emb+=self.channel_embedding(torch.ones_like(dual_channel_board[:,1,:,:].view(B,-1)))
+        x=torch.cat([obs_emb,scratch_emb],dim=1)
+        rows=torch.arange(H,device=device).view(1,H,1).expand(B,H,W); cols=torch.arange(W,device=device).view(1,1,W).expand(B,H,W); pos_ids_single=torch.stack([rows,cols],dim=-1).view(B,H*W,2); pos_ids=torch.cat([pos_ids_single,pos_ids_single],dim=1)
+        for layer in self.transformer.layers: x=layer(x,pos_ids=pos_ids,rope=self.rope)
         return x
-
-    def forward(self, dual_channel_board, mode, action=None, deterministic=False):
-        base_output = self._get_base_output(dual_channel_board)
-        
-        if mode == 'bfs_predict':
-            # Predict the next state of the scratchpad
-            scratchpad_tokens = base_output[:, self.grid_size*self.grid_size:]
-            return self.bfs_head(scratchpad_tokens)
-
-        elif mode == 'rl_act':
-            # Use the combined representation to decide on an action
-            # For RL, we can average the representation of both channels
-            cls_rep = base_output.mean(dim=1)
-            
-            value = self.critic_head(cls_rep)
-            logits = self.actor_head(cls_rep)
-            dist = torch.distributions.Categorical(logits=logits)
-            
-            if action is None:
-                action = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
-            
-            return action, dist.log_prob(action), dist.entropy(), value
+    def forward(self,dual_channel_board,mode,action=None,deterministic=False):
+        base_output=self._get_base_output(dual_channel_board)
+        if mode=='bfs_predict': scratchpad_tokens=base_output[:,self.grid_size*self.grid_size:]; return self.bfs_head(scratchpad_tokens)
+        elif mode=='rl_act':
+            cls_rep=base_output.mean(dim=1); value=self.critic_head(cls_rep); logits=self.actor_head(cls_rep); dist=torch.distributions.Categorical(logits=logits)
+            if action is None: action=torch.argmax(logits,dim=-1) if deterministic else dist.sample()
+            return action,dist.log_prob(action),dist.entropy(),value
 
 # ============================================================================
-# Phase 1: Train BFS Prediction
+# NEW: Validation Function for BFS Prediction
+# ============================================================================
+def validate_bfs_prediction(agent, validation_data, batch_size, device):
+    agent.eval() # Set model to evaluation mode
+    total_loss = 0
+    correct_cells = 0
+    total_cells = 0
+    loss_fn = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for i in range(0, len(validation_data), batch_size):
+            batch = validation_data[i:i+batch_size]
+            if not batch: continue
+            
+            input_boards = torch.cat([t[0] for t in batch])
+            target_boards = torch.cat([t[1] for t in batch])
+            
+            logits = agent(input_boards, mode='bfs_predict')
+            target_scratchpad = target_boards[:, 1, :, :]
+            
+            loss = loss_fn(logits.reshape(-1, len(BFS_VOCAB)), target_scratchpad.reshape(-1))
+            total_loss += loss.item()
+            
+            # Calculate accuracy
+            preds = logits.argmax(dim=-1)
+            target_flat = target_scratchpad.reshape(-1)
+            preds_flat = preds.reshape(-1)
+            
+            correct_cells += (preds_flat == target_flat).sum().item()
+            total_cells += target_flat.numel()
+
+    agent.train() # Set model back to training mode
+    avg_loss = total_loss / (len(validation_data) / batch_size)
+    accuracy = (correct_cells / total_cells) * 100
+    return {'loss': avg_loss, 'accuracy': accuracy}
+
+# ============================================================================
+# MODIFIED: Phase 1 Training with Validation
 # ============================================================================
 def train_bfs_prediction(agent, device, **kwargs):
     print("\n=== Starting Phase 1: Learning to Plan (BFS Prediction) ===\n")
     optimizer = optim.AdamW(agent.parameters(), lr=kwargs['learning_rate'])
     loss_fn = nn.CrossEntropyLoss()
-    
-    # Use the config to create the env, removing the redundant grid_size
     env = VectorizedGridWorldEnv(kwargs['batch_size'], device, **CONFIG['env'], **CONFIG['shared'])
     
-    # Generate all training data upfront
+    # Generate all data and create a train/validation split
     all_transitions = []
     print("Generating BFS transition data...")
-    # Heuristic for number of mazes to generate
-    num_mazes_to_generate = kwargs['total_steps'] // (env.grid_size) 
+    num_mazes_to_generate = kwargs['total_steps'] // env.grid_size
     for _ in range(num_mazes_to_generate // kwargs['batch_size']):
-        env.reset()
-        all_transitions.extend(generate_bfs_transitions(env.grids, env.end_pos))
-    print(f"Generated {len(all_transitions)} transition pairs.")
+        env.reset(); all_transitions.extend(generate_bfs_transitions(env.grids, env.end_pos))
+    
+    np.random.shuffle(all_transitions)
+    split_idx = int(len(all_transitions) * 0.9)
+    train_transitions = all_transitions[:split_idx]
+    val_transitions = all_transitions[split_idx:]
+    print(f"Generated {len(all_transitions)} total transitions. Training on {len(train_transitions)}, Validating on {len(val_transitions)}.")
 
-    num_steps = len(all_transitions) // kwargs['batch_size']
+    num_steps = len(train_transitions) // kwargs['batch_size']
     for step in range(num_steps):
         batch_start = step * kwargs['batch_size']
         batch_end = batch_start + kwargs['batch_size']
-        batch = all_transitions[batch_start:batch_end]
+        batch = train_transitions[batch_start:batch_end]
         if not batch: continue
         
-        input_boards = torch.cat([t[0] for t in batch])
-        target_boards = torch.cat([t[1] for t in batch])
+        input_boards = torch.cat([t[0] for t in batch]); target_boards = torch.cat([t[1] for t in batch])
         
         optimizer.zero_grad()
         logits = agent(input_boards, mode='bfs_predict')
-        
-        # The target for the loss is the scratchpad channel of the target boards
         target_scratchpad = target_boards[:, 1, :, :]
-        
-        # --- THIS IS THE FIX ---
-        # Use .reshape() instead of .view() to handle non-contiguous tensors
         loss = loss_fn(logits.reshape(-1, len(BFS_VOCAB)), target_scratchpad.reshape(-1))
-        # --- END OF FIX ---
+        loss.backward(); optimizer.step()
         
-        loss.backward()
-        optimizer.step()
-        
-        if (step + 1) % 20 == 0:
-            print(f"BFS Training Step {(step + 1) * kwargs['batch_size']}/{len(all_transitions)}, Loss: {loss.item():.4f}")
+        # Periodically run validation
+        if (step + 1) % kwargs['val_interval'] == 0:
+            val_metrics = validate_bfs_prediction(agent, val_transitions, kwargs['batch_size'], device)
+            print(f"BFS Training Step {(step + 1) * kwargs['batch_size']}/{len(train_transitions)}, Train Loss: {loss.item():.4f}")
+            print(f"  Validation -> Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%\n")
 
     print("\nBFS Prediction training complete!\n")
 
 # ============================================================================
-# Phase 2: Train RL Navigation
+# Phase 2: Train RL Navigation (Placeholder)
 # ============================================================================
 def train_rl_navigation(agent, env, device, **kwargs):
     print("\n=== Starting Phase 2: Learning to Act (RL Navigation) ===\n")
-    optimizer = optim.AdamW(agent.parameters(), lr=kwargs['learning_rate'], eps=kwargs['optimizer_eps'])
-    num_updates = kwargs['total_timesteps'] // (kwargs['num_envs'] * kwargs['steps_per_update'])
-    grid_size = env.grid_size
-
-    # (RL buffers and GAE are the same as before)
-    
-    next_state = env.reset()
-    for update in range(1, num_updates + 1):
-        # ... (Rollout collection with thinking loop)
-        # ... (GAE computation)
-        # ... (GRPO update loop)
-        pass # Placeholder for the full RL loop
-        if update % kwargs['log_interval'] == 0:
-            print(f"RL Update {update}/{num_updates}...")
+    # This remains a placeholder for the full RL implementation
+    print("RL training loop is a placeholder. The model is now pre-trained to perform BFS.")
+    print("To implement this, you would:")
+    print("1. Create rollout buffers (states, actions, rewards, etc.).")
+    print("2. In the rollout loop, for each step:")
+    print("   a. Start with a blank scratchpad.")
+    print("   b. Loop for 'thinking_steps': predict the next scratchpad state using the 'bfs_predict' mode.")
+    print("   c. Use the final scratchpad and the observation to get an action with 'rl_act' mode.")
+    print("   d. Step the environment with this action.")
+    print("3. Compute advantages (GAE) and perform GRPO/PPO updates.")
 
 # ============================================================================
 # Main Execution
@@ -316,7 +253,4 @@ if __name__ == '__main__':
     train_bfs_prediction(agent, device, **CONFIG['bfs_prediction'])
     
     # --- PHASE 2 ---
-    # The RL part is conceptually complex to integrate here. The above structure
-    # shows how the model is prepared. The RL loop would need to be
-    # fully written out, including the "thinking" steps.
-    print("\nNOTE: RL training loop is a placeholder. The model is now pre-trained to perform BFS.")
+    train_rl_navigation(agent, None, device)
