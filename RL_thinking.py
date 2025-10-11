@@ -14,14 +14,14 @@ from torch.amp import autocast, GradScaler
 # ============================================================================
 CONFIG = {
     'shared': {
-        'grid_size': 8, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 4,
+        'grid_size': 12, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 4,
     },
     'env': {
-        'wall_density': 1.2, 'max_episode_steps_multiplier': 5,
+        'wall_density': 1.5, 'max_episode_steps_multiplier': 5,
         'reward_step': -0.01, 'reward_collision': -0.1, 'reward_goal': 1.0,
     },
     'model': {
-        'd_model': 128, 'nhead': 4, 'num_layers': 6,
+        'd_model': 128, 'nhead': 4, 'num_layers': 4,
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
     'bfs_prediction': {

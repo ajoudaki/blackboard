@@ -32,7 +32,7 @@ CONFIG = {
     },
     # Training parameters
     'training': {
-        'total_timesteps': 600_000,
+        'total_timesteps': 1_000_000,
         'num_envs': 64,
         'steps_per_update': 64,
         'learning_rate': 1e-4,
