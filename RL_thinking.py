@@ -25,19 +25,19 @@ CONFIG = {
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
     'bfs_prediction': {
-        'total_steps': 200_000, 'batch_size': 32, 'learning_rate': 1e-3,
+        'total_steps': 500_000, 'batch_size': 48, 'learning_rate': 1e-3,
         'val_interval': 100,
     },
     'rl_navigation': {
-        'total_timesteps': 400_000, 'num_envs': 64, 'steps_per_update': 64,
+        'total_timesteps': 1_000_000, 'num_envs': 64, 'steps_per_update': 64,
         'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
-        'epochs_per_update': 4, 'minibatch_size': 256, 'thinking_steps': 8,
+        'epochs_per_update': 4, 'minibatch_size': 256, 'thinking_steps': 12,
     },
     'grpo': { # Using GRPO-style clipping and advantage
         'gamma': 0.99, 'clip_eps': 0.2, 'entropy_coef': 0.01,
     },
     'logging': {
-        'log_interval':10, 'eval_interval': 10, 'eval_episodes': 256,
+        'log_interval':10, 'eval_interval': 10, 'eval_episodes': 512,
     }
 }
 
