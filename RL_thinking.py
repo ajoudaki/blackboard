@@ -21,12 +21,12 @@ CONFIG = {
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
     'bfs_prediction': {
-        'total_steps': 500_000, 'batch_size': 32, 'learning_rate': 1e-3,
+        'total_steps': 400_000, 'batch_size': 32, 'learning_rate': 1e-3,
         'val_interval': 100,
     },
     'rl_navigation': {
         'total_timesteps': 400_000, 'num_envs': 64, 'steps_per_update': 64,
-        'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
+        'learning_rate': 5e-5, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
         'epochs_per_update': 4, 'minibatch_size': 256, 'thinking_steps': 8,
     },
     'grpo': {
@@ -129,23 +129,17 @@ class UnifiedModel(nn.Module):
         self.obs_embedding=nn.Embedding(len(model_config['vocab']),d_model); self.scratch_embedding=nn.Embedding(len(BFS_VOCAB),d_model); self.channel_embedding=nn.Embedding(2,d_model)
         self.rope=RotaryPositionalEmbedding2D(d_model,self.grid_size,model_config['rope_theta']); encoder_layer=RoPETransformerEncoderLayer(d_model,model_config['nhead'],dim_feedforward,model_config['dropout'],batch_first=True); self.transformer=nn.TransformerEncoder(encoder_layer,model_config['num_layers'])
         self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB)); self.actor_head=nn.Linear(d_model,model_config['num_actions']); self.critic_head=nn.Linear(d_model,1)
-    
     def _get_base_output(self,dual_channel_board):
         B,C,H,W=dual_channel_board.shape
-        obs_flat = dual_channel_board[:, 0, :, :].view(B, -1)
-        scratch_flat = dual_channel_board[:, 1, :, :].view(B, -1)
-        obs_emb = self.obs_embedding(obs_flat) + self.channel_embedding(torch.zeros_like(obs_flat))
-        scratch_emb = self.scratch_embedding(scratch_flat) + self.channel_embedding(torch.ones_like(scratch_flat))
+        obs_flat=dual_channel_board[:,0,:,:].reshape(B,-1); scratch_flat=dual_channel_board[:,1,:,:].reshape(B,-1)
+        obs_emb=self.obs_embedding(obs_flat)+self.channel_embedding(torch.zeros_like(obs_flat)); scratch_emb=self.scratch_embedding(scratch_flat)+self.channel_embedding(torch.ones_like(scratch_flat))
         x=torch.cat([obs_emb,scratch_emb],dim=1)
-        rows=torch.arange(H,device=device).view(1,H,1).expand(B,H,W); cols=torch.arange(W,device=device).view(1,1,W).expand(B,H,W); pos_ids_single=torch.stack([rows,cols],dim=-1).view(B,H*W,2); pos_ids=torch.cat([pos_ids_single,pos_ids_single],dim=1)
+        rows=torch.arange(H,device=device).view(1,H,1).expand(B,H,W);cols=torch.arange(W,device=device).view(1,1,W).expand(B,H,W);pos_ids_single=torch.stack([rows,cols],dim=-1).view(B,H*W,2);pos_ids=torch.cat([pos_ids_single,pos_ids_single],dim=1)
         for layer in self.transformer.layers: x=layer(x,pos_ids=pos_ids,rope=self.rope)
         return x
-
     def forward(self,dual_channel_board,mode,action=None,deterministic=False):
         base_output=self._get_base_output(dual_channel_board)
-        if mode=='bfs_predict':
-            scratchpad_tokens_out = base_output[:,self.grid_size*self.grid_size:]
-            return self.bfs_head(scratchpad_tokens_out)
+        if mode=='bfs_predict': scratchpad_tokens_out=base_output[:,self.grid_size*self.grid_size:]; return self.bfs_head(scratchpad_tokens_out)
         elif mode=='rl_act':
             cls_rep=base_output.mean(dim=1); value=self.critic_head(cls_rep); logits=self.actor_head(cls_rep); dist=torch.distributions.Categorical(logits=logits)
             if action is None: action=torch.argmax(logits,dim=-1) if deterministic else dist.sample()
@@ -158,21 +152,19 @@ def validate_bfs_prediction(agent, validation_data, batch_size, device):
     agent.eval(); total_loss=0; correct_cells=0; total_cells=0; loss_fn=nn.CrossEntropyLoss()
     with torch.no_grad():
         for i in range(0,len(validation_data),batch_size):
-            batch=validation_data[i:i+batch_size]
+            batch=validation_data[i:i+batch_size];
             if not batch: continue
             input_boards=torch.cat([t[0] for t in batch]); target_boards=torch.cat([t[1] for t in batch])
             logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
             loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1)); total_loss+=loss.item()
             preds=logits.argmax(dim=-1); target_flat=target_scratchpad.reshape(-1); preds_flat=preds.reshape(-1)
             correct_cells+=(preds_flat==target_flat).sum().item(); total_cells+=target_flat.numel()
-    agent.train(); avg_loss=total_loss/(len(validation_data)/batch_size); accuracy=(correct_cells/total_cells)*100
+    agent.train(); avg_loss=total_loss/max(1,len(validation_data)/batch_size); accuracy=(correct_cells/total_cells)*100
     return {'loss':avg_loss,'accuracy':accuracy}
 
 def train_bfs_prediction(agent, device, **kwargs):
-    print("\n=== Starting Phase 1: Learning to Plan (BFS Prediction) ===\n")
-    optimizer=optim.AdamW(agent.parameters(),lr=kwargs['learning_rate']); loss_fn=nn.CrossEntropyLoss()
-    env=VectorizedGridWorldEnv(kwargs['batch_size'],device,**CONFIG['env'],**CONFIG['shared'])
-    all_transitions=[]; print("Generating BFS transition data...")
+    print("\n=== Starting Phase 1: Learning to Plan (BFS Prediction) ===\n"); optimizer=optim.AdamW(agent.parameters(),lr=kwargs['learning_rate']); loss_fn=nn.CrossEntropyLoss()
+    env=VectorizedGridWorldEnv(kwargs['batch_size'],device,**CONFIG['env'],**CONFIG['shared']); all_transitions=[]; print("Generating BFS transition data...")
     num_mazes_to_generate=kwargs['total_steps']//env.grid_size
     for _ in range(num_mazes_to_generate//kwargs['batch_size']): env.reset();all_transitions.extend(generate_bfs_transitions(env.grids,env.end_pos))
     np.random.shuffle(all_transitions); split_idx=int(len(all_transitions)*0.9); train_transitions=all_transitions[:split_idx]; val_transitions=all_transitions[split_idx:]
@@ -188,7 +180,7 @@ def train_bfs_prediction(agent, device, **kwargs):
             val_metrics=validate_bfs_prediction(agent,val_transitions,kwargs['batch_size'],device)
             print(f"BFS Training Step {(step+1)*kwargs['batch_size']}/{len(train_transitions)}, Train Loss: {loss.item():.4f}")
             print(f"  Validation -> Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%\n")
-    print("\nBFS Prediction training complete!\n")
+    print("\nBFS Prediction training complete!\n"); return val_transitions
 
 def compute_gae(rewards,values,terminals,next_value,gamma,gae_lambda):
     steps=len(rewards);advantages=torch.zeros_like(rewards);last_gae=0
@@ -198,48 +190,57 @@ def compute_gae(rewards,values,terminals,next_value,gamma,gae_lambda):
         delta=rewards[t]+gamma*next_val*next_non_terminal-values[t]; advantages[t]=last_gae=delta+gamma*gae_lambda*next_non_terminal*last_gae
     return advantages,advantages+values
 
-def train_rl_navigation(agent, env, device, **rl_config):
+def evaluate_rl_navigation(agent, device, eval_episodes, thinking_steps, **kwargs):
+    print("  --- Running RL Validation ---")
+    eval_env=VectorizedGridWorldEnv(eval_episodes,device,**CONFIG['env'],**CONFIG['shared']); obs_state=eval_env.reset()
+    active=torch.ones(eval_episodes,dtype=torch.bool,device=device); ep_lengths=torch.zeros(eval_episodes,device=device)
+    successes,total_len,total_shortest=0,0,0; start_pos=eval_env.agent_pos.clone(); end_pos=eval_env.end_pos.clone()
+    for _ in range(eval_env.max_steps):
+        with torch.no_grad():
+            scratchpad=torch.full((eval_episodes,eval_env.grid_size,eval_env.grid_size),bfs_stoi['UKN'],device=device)
+            scratchpad[torch.arange(eval_episodes),end_pos[:,0],end_pos[:,1]]=bfs_stoi['0']; scratchpad[eval_env.grids==stoi['#']]=bfs_stoi['INF']
+            current_board_state=torch.stack([obs_state,scratchpad],dim=1)
+            for _ in range(thinking_steps):
+                logits=agent(current_board_state,mode='bfs_predict'); preds=logits.argmax(dim=-1)
+                current_board_state[:,1,:,:]=preds.view(eval_episodes,eval_env.grid_size,eval_env.grid_size)
+            actions=agent(current_board_state,mode='rl_act',deterministic=True)[0]
+        obs_state,_,_,goal_reached=eval_env.step(actions); ep_lengths[active]+=1
+        finished=torch.where(goal_reached&active)[0]
+        if len(finished)>0:
+            successes+=len(finished)
+            for i in finished: total_len+=ep_lengths[i].item(); total_shortest+=torch.abs(start_pos[i]-end_pos[i]).sum().item()
+            active[finished]=False
+        if not active.any():break
+    return {'success_rate':(successes/eval_episodes)*100,'avg_len':total_len/successes if successes>0 else float('nan'),'efficiency':total_len/max(1,total_shortest)if successes>0 else float('nan')}
+
+def train_rl_navigation(agent, env, device, val_transitions, **rl_config):
     print("\n=== Starting Phase 2: Learning to Act (RL Navigation) ===\n")
-    optimizer=optim.AdamW(agent.parameters(),lr=rl_config['learning_rate'],eps=rl_config['optimizer_eps'])
-    num_updates=rl_config['total_timesteps']//(rl_config['num_envs']*rl_config['steps_per_update']); grid_size=env.grid_size; grpo_params=CONFIG['grpo']
-    
+    optimizer=optim.AdamW(agent.parameters(),lr=rl_config['learning_rate'],eps=rl_config['optimizer_eps']);num_updates=rl_config['total_timesteps']//(rl_config['num_envs']*rl_config['steps_per_update']);grid_size=env.grid_size;grpo_params=CONFIG['grpo']
     buffers=[torch.zeros((rl_config['steps_per_update'],rl_config['num_envs'],*s),dtype=d,device=device)for s,d in[((2,grid_size,grid_size),torch.long),((),torch.long),((),torch.float),((),torch.float),((),torch.float),((),torch.float)]]
-    states,actions,log_probs,rewards,values,terminals=buffers
-    
-    obs_state=env.reset(); next_terminal=torch.zeros(rl_config['num_envs'],device=device)
-    
+    states_buffer,actions_buffer,log_probs_buffer,rewards_buffer,values_buffer,terminals_buffer=buffers
+    obs_state=env.reset()
     for update in range(1,num_updates+1):
         for step in range(rl_config['steps_per_update']):
             with torch.no_grad():
                 scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
-                scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0']
-                scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
-                
+                scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
                 current_board_state=torch.stack([obs_state,scratchpad],dim=1)
                 for _ in range(rl_config['thinking_steps']):
-                    logits=agent(current_board_state,mode='bfs_predict'); preds=logits.argmax(dim=-1)
-                    current_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
-                
-                states[step]=current_board_state
-                action,log_prob,_,value=agent(current_board_state,mode='rl_act'); values[step]=value.flatten()
-
-            actions[step]=action;log_probs[step]=log_prob
-            obs_state,reward,done,next_terminal=env.step(action);rewards[step]=reward;terminals[step]=next_terminal
-        
+                    logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
+                states_buffer[step]=current_board_state
+                action,log_prob,_,value=agent(current_board_state,mode='rl_act');values_buffer[step]=value.flatten()
+            actions_buffer[step]=action;log_probs_buffer[step]=log_prob
+            obs_state,reward,_,terminal=env.step(action);rewards_buffer[step]=reward;terminals_buffer[step]=terminal
         with torch.no_grad():
             final_scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
-            final_scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0']
-            final_scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
+            final_scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];final_scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
             final_board_state=torch.stack([obs_state,final_scratchpad],dim=1)
             for _ in range(rl_config['thinking_steps']):
-                logits=agent(final_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1)
-                final_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
+                logits=agent(final_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);final_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
             next_value=agent(final_board_state,mode='rl_act')[3].reshape(1,-1)
-            advantages,returns=compute_gae(rewards,values,terminals,next_value,grpo_params['gamma'],grpo_params['gae_lambda'])
-
-        b_states=states.reshape(-1,2,grid_size,grid_size);b_actions=actions.reshape(-1);b_log_probs=log_probs.reshape(-1);b_advantages=advantages.reshape(-1);b_returns=returns.reshape(-1)
+            advantages,returns=compute_gae(rewards_buffer,values_buffer,terminals_buffer,next_value,grpo_params['gamma'],grpo_params['gae_lambda'])
+        b_states=states_buffer.reshape(-1,2,grid_size,grid_size);b_actions=actions_buffer.reshape(-1);b_log_probs=log_probs_buffer.reshape(-1);b_advantages=advantages.reshape(-1);b_returns=returns.reshape(-1)
         b_inds=np.arange(rl_config['num_envs']*rl_config['steps_per_update']);pg_losses,v_losses,ent_losses=[],[],[]
-        
         for _ in range(rl_config['epochs_per_update']):
             np.random.shuffle(b_inds)
             for start in range(0,len(b_inds),rl_config['minibatch_size']):
@@ -251,18 +252,48 @@ def train_rl_navigation(agent, env, device, **rl_config):
                 loss=pg_loss-grpo_params['entropy_coef']*ent_loss+grpo_params['value_coef']*v_loss
                 optimizer.zero_grad();loss.backward();nn.utils.clip_grad_norm_(agent.parameters(),rl_config['grad_clip_norm']);optimizer.step()
                 pg_losses.append(pg_loss.item());v_losses.append(v_loss.item());ent_losses.append(ent_loss.item())
-        
-        if update%CONFIG['logging']['log_interval']==0:
-            print(f"RL Update {update}/{num_updates}");print(f"  Policy: {np.mean(pg_losses):.4f} | Value: {np.mean(v_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
-            if update%CONFIG['logging']['eval_interval']==0:print("  (RL Evaluation not yet implemented)")
+        if update % CONFIG['logging']['log_interval'] == 0:
+            print(f"RL Update {update}/{num_updates}"); print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Value Loss: {np.mean(v_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
+            if update % CONFIG['logging']['eval_interval'] == 0:
+                rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'], **CONFIG['rl_navigation'])
+                print(f"  RL Validation -> Success: {rl_metrics['success_rate']:.1f}% | Length: {rl_metrics['avg_len']:.1f} | Efficiency: {rl_metrics['efficiency']:.2f}")
+                bfs_metrics = validate_bfs_prediction(agent, val_transitions, CONFIG['bfs_prediction']['batch_size'], device)
+                print(f"  BFS Validation -> Loss: {bfs_metrics['loss']:.4f}, Accuracy: {bfs_metrics['accuracy']:.2f}%")
             print()
     print("RL Training complete!")
+
+def infer(agent,device,**kwargs):
+    print("\n=== Inference ===");infer_env=VectorizedGridWorldEnv(1,device,**CONFIG['env'],**CONFIG['shared']);obs_state=infer_env.reset();grid_size=infer_env.grid_size
+    for step in range(infer_env.max_steps):
+        print(f"\n--- Step {step+1} ---");
+        with torch.no_grad():
+            scratchpad=torch.full((1,grid_size,grid_size),bfs_stoi['UKN'],device=device)
+            scratchpad[0,infer_env.end_pos[0,0],infer_env.end_pos[0,1]]=bfs_stoi['0'];scratchpad[infer_env.grids==stoi['#']]=bfs_stoi['INF']
+            current_board_state=torch.stack([obs_state,scratchpad],dim=1)
+            print("Agent is thinking...")
+            for think_step in range(kwargs['thinking_steps']):
+                logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1)
+                current_board_state[:,1,:,:]=preds.view(1,grid_size,grid_size)
+                # Optional: print scratchpad to visualize thinking
+                # if (think_step + 1) % 2 == 0:
+                #     scratch_np = current_board_state[0, 1].cpu().numpy()
+                #     print("\n".join(" ".join(f"{bfs_itos[c]:>3}" for c in row) for row in scratch_np))
+
+            print("Agent is acting...")
+            action=agent(current_board_state,mode='rl_act',deterministic=True)[0]
+        
+        obs_state,reward,done,goal_reached=infer_env.step(action)
+        grid_vis=obs_state.cpu().numpy()[0];print("\n".join("".join(itos[c] for c in row) for row in grid_vis))
+        if goal_reached.any():print(f"\n✓ Success in {step+1} steps!");return
+        if done.any():print(f"\n✗ Timeout after {step+1} steps");return
+    print(f"\n✗ Failed to reach goal")
 
 # ============================================================================
 # Main Execution
 # ============================================================================
 if __name__ == '__main__':
     agent = UnifiedModel(**CONFIG['model'], **CONFIG['shared']).to(device)
-    train_bfs_prediction(agent, device, **CONFIG['bfs_prediction'])
+    val_transitions = train_bfs_prediction(agent, device, **CONFIG['bfs_prediction'])
     rl_env = VectorizedGridWorldEnv(CONFIG['rl_navigation']['num_envs'], device, **CONFIG['env'], **CONFIG['shared'])
-    train_rl_navigation(agent, rl_env, device, **CONFIG['rl_navigation'])
+    train_rl_navigation(agent, rl_env, device, val_transitions, **CONFIG['rl_navigation'])
+    infer(agent, device, **CONFIG['rl_navigation'])
