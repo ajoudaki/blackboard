@@ -4,6 +4,10 @@ import torch.optim as optim
 import numpy as np
 import collections
 import time
+from torch.amp import autocast, GradScaler
+
+
+# MODIFICATION END
 
 # ============================================================================
 # Hierarchical Configuration
@@ -21,25 +25,28 @@ CONFIG = {
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
     'bfs_prediction': {
-        'total_steps': 400_000, 'batch_size': 32, 'learning_rate': 1e-3,
+        'total_steps': 200_000, 'batch_size': 32, 'learning_rate': 1e-3,
         'val_interval': 100,
     },
     'rl_navigation': {
         'total_timesteps': 400_000, 'num_envs': 64, 'steps_per_update': 64,
-        'learning_rate': 5e-5, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
+        'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
         'epochs_per_update': 4, 'minibatch_size': 256, 'thinking_steps': 8,
     },
-    'grpo': {
-        'gamma': 0.99, 'gae_lambda': 0.95, 'grpo_beta': 0.1,
-        'value_coef': 0.5, 'entropy_coef': 0.01,
+    'grpo': { # Using GRPO-style clipping and advantage
+        'gamma': 0.99, 'clip_eps': 0.2, 'entropy_coef': 0.01,
     },
     'logging': {
-        'log_interval': 10, 'eval_interval': 10, 'eval_episodes': 256,
+        'log_interval':10, 'eval_interval': 10, 'eval_episodes': 256,
     }
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}\n")
+# MODIFICATION START: Flag to enable AMP only on CUDA devices
+use_amp = torch.cuda.is_available()
+print(f"Using device: {device} | Mixed Precision (FP16) Enabled: {use_amp}\n")
+# MODIFICATION END
+
 
 # Vocabs
 BFS_VOCAB = [str(i) for i in range(100)] + ['INF', 'UKN']
@@ -99,7 +106,7 @@ class VectorizedGridWorldEnv:
         env_idx=torch.arange(self.num_envs,device=self.device)[mask]; self.grids[env_idx,self.start_pos[mask,0],self.start_pos[mask,1]]=stoi['S']; self.grids[env_idx,self.end_pos[mask,0],self.end_pos[mask,1]]=stoi['E']
 
 # ============================================================================
-# Model Architecture
+# Model Architecture 
 # ============================================================================
 class RotaryPositionalEmbedding2D(nn.Module):
     def __init__(self,d_model,grid_size,rope_theta):
@@ -128,7 +135,7 @@ class UnifiedModel(nn.Module):
         super().__init__(); self.grid_size=model_config['grid_size']; d_model=model_config['d_model']; dim_feedforward=d_model*model_config['dim_feedforward_multiplier']
         self.obs_embedding=nn.Embedding(len(model_config['vocab']),d_model); self.scratch_embedding=nn.Embedding(len(BFS_VOCAB),d_model); self.channel_embedding=nn.Embedding(2,d_model)
         self.rope=RotaryPositionalEmbedding2D(d_model,self.grid_size,model_config['rope_theta']); encoder_layer=RoPETransformerEncoderLayer(d_model,model_config['nhead'],dim_feedforward,model_config['dropout'],batch_first=True); self.transformer=nn.TransformerEncoder(encoder_layer,model_config['num_layers'])
-        self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB)); self.actor_head=nn.Linear(d_model,model_config['num_actions']); self.critic_head=nn.Linear(d_model,1)
+        self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB)); self.actor_head=nn.Linear(d_model,model_config['num_actions']) 
     def _get_base_output(self,dual_channel_board):
         B,C,H,W=dual_channel_board.shape
         obs_flat=dual_channel_board[:,0,:,:].reshape(B,-1); scratch_flat=dual_channel_board[:,1,:,:].reshape(B,-1)
@@ -141,9 +148,9 @@ class UnifiedModel(nn.Module):
         base_output=self._get_base_output(dual_channel_board)
         if mode=='bfs_predict': scratchpad_tokens_out=base_output[:,self.grid_size*self.grid_size:]; return self.bfs_head(scratchpad_tokens_out)
         elif mode=='rl_act':
-            cls_rep=base_output.mean(dim=1); value=self.critic_head(cls_rep); logits=self.actor_head(cls_rep); dist=torch.distributions.Categorical(logits=logits)
+            cls_rep=base_output.mean(dim=1); logits=self.actor_head(cls_rep); dist=torch.distributions.Categorical(logits=logits)
             if action is None: action=torch.argmax(logits,dim=-1) if deterministic else dist.sample()
-            return action,dist.log_prob(action),dist.entropy(),value
+            return action,dist.log_prob(action),dist.entropy()
 
 # ============================================================================
 # Training & Evaluation
@@ -155,8 +162,11 @@ def validate_bfs_prediction(agent, validation_data, batch_size, device):
             batch=validation_data[i:i+batch_size];
             if not batch: continue
             input_boards=torch.cat([t[0] for t in batch]); target_boards=torch.cat([t[1] for t in batch])
-            logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
-            loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1)); total_loss+=loss.item()
+            # MODIFICATION START: Use autocast during validation for consistency
+            with autocast(device_type='cuda', enabled=use_amp):
+                logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
+                loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1)); total_loss+=loss.item()
+            # MODIFICATION END
             preds=logits.argmax(dim=-1); target_flat=target_scratchpad.reshape(-1); preds_flat=preds.reshape(-1)
             correct_cells+=(preds_flat==target_flat).sum().item(); total_cells+=target_flat.numel()
     agent.train(); avg_loss=total_loss/max(1,len(validation_data)/batch_size); accuracy=(correct_cells/total_cells)*100
@@ -164,6 +174,9 @@ def validate_bfs_prediction(agent, validation_data, batch_size, device):
 
 def train_bfs_prediction(agent, device, **kwargs):
     print("\n=== Starting Phase 1: Learning to Plan (BFS Prediction) ===\n"); optimizer=optim.AdamW(agent.parameters(),lr=kwargs['learning_rate']); loss_fn=nn.CrossEntropyLoss()
+    # MODIFICATION START: Initialize GradScaler
+    scaler = GradScaler('cuda', enabled=use_amp)
+    # MODIFICATION END
     env=VectorizedGridWorldEnv(kwargs['batch_size'],device,**CONFIG['env'],**CONFIG['shared']); all_transitions=[]; print("Generating BFS transition data...")
     num_mazes_to_generate=kwargs['total_steps']//env.grid_size
     for _ in range(num_mazes_to_generate//kwargs['batch_size']): env.reset();all_transitions.extend(generate_bfs_transitions(env.grids,env.end_pos))
@@ -174,21 +187,24 @@ def train_bfs_prediction(agent, device, **kwargs):
         batch_start=step*kwargs['batch_size']; batch_end=batch_start+kwargs['batch_size']; batch=train_transitions[batch_start:batch_end]
         if not batch: continue
         input_boards=torch.cat([t[0] for t in batch]);target_boards=torch.cat([t[1] for t in batch])
-        optimizer.zero_grad(); logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
-        loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1)); loss.backward();optimizer.step()
+        
+        optimizer.zero_grad()
+        # MODIFICATION START: Wrap forward pass and loss calculation in autocast
+        with autocast(device_type='cuda', enabled=use_amp):
+            logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
+            loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1))
+        
+        # Scale loss, perform backward pass, and update weights
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        # MODIFICATION END
+
         if(step+1)%kwargs['val_interval']==0:
             val_metrics=validate_bfs_prediction(agent,val_transitions,kwargs['batch_size'],device)
             print(f"BFS Training Step {(step+1)*kwargs['batch_size']}/{len(train_transitions)}, Train Loss: {loss.item():.4f}")
             print(f"  Validation -> Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%\n")
     print("\nBFS Prediction training complete!\n"); return val_transitions
-
-def compute_gae(rewards,values,terminals,next_value,gamma,gae_lambda):
-    steps=len(rewards);advantages=torch.zeros_like(rewards);last_gae=0
-    for t in reversed(range(steps)):
-        if t==steps-1: next_non_terminal=1.0-terminals[-1].float(); next_val=next_value
-        else: next_non_terminal=1.0-terminals[t+1].float(); next_val=values[t+1]
-        delta=rewards[t]+gamma*next_val*next_non_terminal-values[t]; advantages[t]=last_gae=delta+gamma*gae_lambda*next_non_terminal*last_gae
-    return advantages,advantages+values
 
 def evaluate_rl_navigation(agent, device, eval_episodes, thinking_steps, **kwargs):
     print("  --- Running RL Validation ---")
@@ -197,13 +213,16 @@ def evaluate_rl_navigation(agent, device, eval_episodes, thinking_steps, **kwarg
     successes,total_len,total_shortest=0,0,0; start_pos=eval_env.agent_pos.clone(); end_pos=eval_env.end_pos.clone()
     for _ in range(eval_env.max_steps):
         with torch.no_grad():
-            scratchpad=torch.full((eval_episodes,eval_env.grid_size,eval_env.grid_size),bfs_stoi['UKN'],device=device)
-            scratchpad[torch.arange(eval_episodes),end_pos[:,0],end_pos[:,1]]=bfs_stoi['0']; scratchpad[eval_env.grids==stoi['#']]=bfs_stoi['INF']
-            current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-            for _ in range(thinking_steps):
-                logits=agent(current_board_state,mode='bfs_predict'); preds=logits.argmax(dim=-1)
-                current_board_state[:,1,:,:]=preds.view(eval_episodes,eval_env.grid_size,eval_env.grid_size)
-            actions=agent(current_board_state,mode='rl_act',deterministic=True)[0]
+            # MODIFICATION START: Use autocast in evaluation
+            with autocast(device_type='cuda', enabled=use_amp):
+                scratchpad=torch.full((eval_episodes,eval_env.grid_size,eval_env.grid_size),bfs_stoi['UKN'],device=device)
+                scratchpad[torch.arange(eval_episodes),end_pos[:,0],end_pos[:,1]]=bfs_stoi['0']; scratchpad[eval_env.grids==stoi['#']]=bfs_stoi['INF']
+                current_board_state=torch.stack([obs_state,scratchpad],dim=1)
+                for _ in range(thinking_steps):
+                    logits=agent(current_board_state,mode='bfs_predict'); preds=logits.argmax(dim=-1)
+                    current_board_state[:,1,:,:]=preds.view(eval_episodes,eval_env.grid_size,eval_env.grid_size)
+                actions=agent(current_board_state,mode='rl_act',deterministic=True)[0]
+            # MODIFICATION END
         obs_state,_,_,goal_reached=eval_env.step(actions); ep_lengths[active]+=1
         finished=torch.where(goal_reached&active)[0]
         if len(finished)>0:
@@ -214,51 +233,75 @@ def evaluate_rl_navigation(agent, device, eval_episodes, thinking_steps, **kwarg
     return {'success_rate':(successes/eval_episodes)*100,'avg_len':total_len/successes if successes>0 else float('nan'),'efficiency':total_len/max(1,total_shortest)if successes>0 else float('nan')}
 
 def train_rl_navigation(agent, env, device, val_transitions, **rl_config):
-    print("\n=== Starting Phase 2: Learning to Act (RL Navigation) ===\n")
+    print("\n=== Starting Phase 2: Learning to Act   ===\n")
     optimizer=optim.AdamW(agent.parameters(),lr=rl_config['learning_rate'],eps=rl_config['optimizer_eps']);num_updates=rl_config['total_timesteps']//(rl_config['num_envs']*rl_config['steps_per_update']);grid_size=env.grid_size;grpo_params=CONFIG['grpo']
-    buffers=[torch.zeros((rl_config['steps_per_update'],rl_config['num_envs'],*s),dtype=d,device=device)for s,d in[((2,grid_size,grid_size),torch.long),((),torch.long),((),torch.float),((),torch.float),((),torch.float),((),torch.float)]]
-    states_buffer,actions_buffer,log_probs_buffer,rewards_buffer,values_buffer,terminals_buffer=buffers
+    # MODIFICATION START: Initialize GradScaler for RL training
+    scaler = GradScaler('cuda', enabled=use_amp)
+    # MODIFICATION END
+    buffers=[torch.zeros((rl_config['steps_per_update'],rl_config['num_envs'],*s),dtype=d,device=device)for s,d in[((2,grid_size,grid_size),torch.long),((),torch.long),((),torch.float),((),torch.float),((),torch.bool)]]
+    states_buffer,actions_buffer,log_probs_buffer,rewards_buffer,terminals_buffer=buffers
     obs_state=env.reset()
     for update in range(1,num_updates+1):
         for step in range(rl_config['steps_per_update']):
             with torch.no_grad():
-                scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
-                scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
-                current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-                for _ in range(rl_config['thinking_steps']):
-                    logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
-                states_buffer[step]=current_board_state
-                action,log_prob,_,value=agent(current_board_state,mode='rl_act');values_buffer[step]=value.flatten()
+                # MODIFICATION START: Use autocast for inference part of RL loop
+                with autocast(device_type='cuda', enabled=use_amp):
+                    scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
+                    scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
+                    current_board_state=torch.stack([obs_state,scratchpad],dim=1)
+                    for _ in range(rl_config['thinking_steps']):
+                        logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
+                    states_buffer[step]=current_board_state
+                    action,log_prob,entropy=agent(current_board_state,mode='rl_act')
+                # MODIFICATION END
             actions_buffer[step]=action;log_probs_buffer[step]=log_prob
             obs_state,reward,_,terminal=env.step(action);rewards_buffer[step]=reward;terminals_buffer[step]=terminal
+        
+        # advantage calculation
         with torch.no_grad():
-            final_scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
-            final_scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];final_scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
-            final_board_state=torch.stack([obs_state,final_scratchpad],dim=1)
-            for _ in range(rl_config['thinking_steps']):
-                logits=agent(final_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);final_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
-            next_value=agent(final_board_state,mode='rl_act')[3].reshape(1,-1)
-            advantages,returns=compute_gae(rewards_buffer,values_buffer,terminals_buffer,next_value,grpo_params['gamma'],grpo_params['gae_lambda'])
-        b_states=states_buffer.reshape(-1,2,grid_size,grid_size);b_actions=actions_buffer.reshape(-1);b_log_probs=log_probs_buffer.reshape(-1);b_advantages=advantages.reshape(-1);b_returns=returns.reshape(-1)
-        b_inds=np.arange(rl_config['num_envs']*rl_config['steps_per_update']);pg_losses,v_losses,ent_losses=[],[],[]
+            returns = torch.zeros_like(rewards_buffer)
+            for t in reversed(range(rl_config['steps_per_update'])):
+                if t == rl_config['steps_per_update'] - 1:
+                    next_return = 0 # No next state value
+                else:
+                    next_return = returns[t+1]
+                returns[t] = rewards_buffer[t] + grpo_params['gamma'] * next_return * (1.0 - terminals_buffer[t].float())
+            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+        b_states=states_buffer.reshape(-1,2,grid_size,grid_size);b_actions=actions_buffer.reshape(-1);b_log_probs=log_probs_buffer.reshape(-1);b_advantages=advantages.reshape(-1)
+        b_inds=np.arange(rl_config['num_envs']*rl_config['steps_per_update']);pg_losses,ent_losses=[],[]
+        
         for _ in range(rl_config['epochs_per_update']):
             np.random.shuffle(b_inds)
             for start in range(0,len(b_inds),rl_config['minibatch_size']):
                 mb_inds=b_inds[start:start+rl_config['minibatch_size']]
-                _,new_log_prob,entropy,new_value=agent(b_states[mb_inds],mode='rl_act',action=b_actions[mb_inds])
-                mb_adv=b_advantages[mb_inds];rel_adv=(mb_adv-mb_adv.mean())/(mb_adv.std()+1e-8)
-                ratio=torch.exp(new_log_prob-b_log_probs[mb_inds]);pg_loss=-(rel_adv*ratio-grpo_params['grpo_beta']*(ratio-1)**2).mean()
-                v_loss=0.5*((new_value.view(-1)-b_returns[mb_inds])**2).mean();ent_loss=entropy.mean()
-                loss=pg_loss-grpo_params['entropy_coef']*ent_loss+grpo_params['value_coef']*v_loss
-                optimizer.zero_grad();loss.backward();nn.utils.clip_grad_norm_(agent.parameters(),rl_config['grad_clip_norm']);optimizer.step()
-                pg_losses.append(pg_loss.item());v_losses.append(v_loss.item());ent_losses.append(ent_loss.item())
+                # MODIFICATION START: Mixed precision PPO update
+                optimizer.zero_grad()
+                with autocast(device_type='cuda', enabled=use_amp):
+                    _,new_log_prob,entropy=agent(b_states[mb_inds],mode='rl_act',action=b_actions[mb_inds])
+                    ratio=torch.exp(new_log_prob-b_log_probs[mb_inds])
+                    pg_loss1 = -b_advantages[mb_inds] * ratio
+                    pg_loss2 = -b_advantages[mb_inds] * torch.clamp(ratio, 1-grpo_params['clip_eps'], 1+grpo_params['clip_eps'])
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    ent_loss = entropy.mean()
+                    loss = pg_loss - grpo_params['entropy_coef'] * ent_loss
+                
+                scaler.scale(loss).backward()
+                # Unscale gradients before clipping to avoid clipping scaled gradients
+                scaler.unscale_(optimizer) 
+                nn.utils.clip_grad_norm_(agent.parameters(),rl_config['grad_clip_norm'])
+                scaler.step(optimizer)
+                scaler.update()
+                # MODIFICATION END
+                pg_losses.append(pg_loss.item());ent_losses.append(ent_loss.item())
+
         if update % CONFIG['logging']['log_interval'] == 0:
-            print(f"RL Update {update}/{num_updates}"); print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Value Loss: {np.mean(v_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
+            print(f"RL Update {update}/{num_updates}"); print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
             if update % CONFIG['logging']['eval_interval'] == 0:
                 rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'], **CONFIG['rl_navigation'])
                 print(f"  RL Validation -> Success: {rl_metrics['success_rate']:.1f}% | Length: {rl_metrics['avg_len']:.1f} | Efficiency: {rl_metrics['efficiency']:.2f}")
                 bfs_metrics = validate_bfs_prediction(agent, val_transitions, CONFIG['bfs_prediction']['batch_size'], device)
-                print(f"  BFS Validation -> Loss: {bfs_metrics['loss']:.4f}, Accuracy: {bfs_metrics['accuracy']:.2f}%")
+                print(f"  BFS Validation -> Accuracy: {bfs_metrics['accuracy']:.2f}%")
             print()
     print("RL Training complete!")
 
@@ -267,21 +310,17 @@ def infer(agent,device,**kwargs):
     for step in range(infer_env.max_steps):
         print(f"\n--- Step {step+1} ---");
         with torch.no_grad():
-            scratchpad=torch.full((1,grid_size,grid_size),bfs_stoi['UKN'],device=device)
-            scratchpad[0,infer_env.end_pos[0,0],infer_env.end_pos[0,1]]=bfs_stoi['0'];scratchpad[infer_env.grids==stoi['#']]=bfs_stoi['INF']
-            current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-            print("Agent is thinking...")
-            for think_step in range(kwargs['thinking_steps']):
-                logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1)
-                current_board_state[:,1,:,:]=preds.view(1,grid_size,grid_size)
-                # Optional: print scratchpad to visualize thinking
-                # if (think_step + 1) % 2 == 0:
-                #     scratch_np = current_board_state[0, 1].cpu().numpy()
-                #     print("\n".join(" ".join(f"{bfs_itos[c]:>3}" for c in row) for row in scratch_np))
-
-            print("Agent is acting...")
-            action=agent(current_board_state,mode='rl_act',deterministic=True)[0]
-        
+            # MODIFICATION START: Use autocast during inference
+            with autocast(device_type='cuda', enabled=use_amp):
+                scratchpad=torch.full((1,grid_size,grid_size),bfs_stoi['UKN'],device=device)
+                scratchpad[0,infer_env.end_pos[0,0],infer_env.end_pos[0,1]]=bfs_stoi['0'];scratchpad[infer_env.grids==stoi['#']]=bfs_stoi['INF']
+                current_board_state=torch.stack([obs_state,scratchpad],dim=1)
+                print("Agent is thinking...")
+                for think_step in range(kwargs['thinking_steps']):
+                    logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(1,grid_size,grid_size)
+                print("Agent is acting...")
+                action=agent(current_board_state,mode='rl_act',deterministic=True)[0]
+            # MODIFICATION END
         obs_state,reward,done,goal_reached=infer_env.step(action)
         grid_vis=obs_state.cpu().numpy()[0];print("\n".join("".join(itos[c] for c in row) for row in grid_vis))
         if goal_reached.any():print(f"\n✓ Success in {step+1} steps!");return
