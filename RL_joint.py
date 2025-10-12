@@ -6,18 +6,16 @@ import collections
 import time
 from torch.amp import autocast, GradScaler
 
-
 # ============================================================================
 # Hierarchical Configuration
 # ============================================================================
 CONFIG = {
     'shared': {
-        # MODIFICATION: Added 1 for the IDLE action
-        'grid_size': 8, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 5,
+        'grid_size': 8, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 5, # 4 directions + 1 idle
     },
     'env': {
         'wall_density': 1.2, 'max_episode_steps_multiplier': 5,
-        'reward_step': -0.01, 'reward_collision': -0.1, 'reward_goal': 1.0,
+        'reward_step': -0.01, 'reward_collision': -0.1, 'reward_goal': 1.0,  'format_penalty': -1.0,
     },
     'model': {
         'd_model': 128, 'nhead': 4, 'num_layers': 6,
@@ -28,13 +26,12 @@ CONFIG = {
         'val_interval': 100,
     },
     'rl_navigation': {
-        'total_timesteps': 400_000, 'num_envs': 64, 'steps_per_update': 64,
+        'total_timesteps': 1_000_000, 'num_envs': 64, 'steps_per_update': 64,
         'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
         'epochs_per_update': 4, 'minibatch_size': 256,
-        # MODIFICATION: thinking_steps is no longer needed as it's learned
     },
     'grpo': {
-        'gamma': 0.99, 'clip_eps': 0.2, 'entropy_coef': 0.01,
+        'gamma': 0.99, 'clip_eps': 0.2, 'entropy_coef': 0.05, 
     },
     'logging': {
         'log_interval':10, 'eval_interval': 10, 'eval_episodes': 256,
@@ -70,14 +67,9 @@ class VectorizedGridWorldEnv:
         return state
     def step(self,actions):
         self.episode_steps+=1
-        # MODIFICATION: Handle IDLE action (action index 4). Agent position does not change.
         IDLE_ACTION = CONFIG['shared']['num_actions'] - 1
         is_move = actions != IDLE_ACTION
-        
-        # Start with current positions
         next_pos = self.agent_pos.clone()
-        
-        # Calculate next positions only for agents that are moving
         move_indices = torch.where(is_move)[0]
         if len(move_indices) > 0:
             move_actions = actions[move_indices]
@@ -85,20 +77,15 @@ class VectorizedGridWorldEnv:
             temp_pos[move_actions == 0, 0] -= 1; temp_pos[move_actions == 1, 0] += 1
             temp_pos[move_actions == 2, 1] -= 1; temp_pos[move_actions == 3, 1] += 1
             next_pos[move_indices] = temp_pos
-
-        # Collision checks are only relevant for moving agents
         out_of_bounds = ((next_pos < 0) | (next_pos >= self.grid_size)).any(dim=1)
         wall_collision = torch.zeros_like(out_of_bounds)
-        valid_pos_check_indices = torch.where(~out_of_bounds & is_move)[0] # Only check non-OOB movers
+        valid_pos_check_indices = torch.where(~out_of_bounds & is_move)[0]
         if len(valid_pos_check_indices) > 0:
             valid_pos = next_pos[valid_pos_check_indices]
             wall_collision[valid_pos_check_indices] = self.grids[valid_pos_check_indices, valid_pos[:, 0], valid_pos[:, 1]] == stoi['#']
-        
         collided = (out_of_bounds | wall_collision) & is_move
         valid_moves = ~collided
-        
         self.agent_pos[valid_moves] = next_pos[valid_moves]
-        
         rewards = torch.full((self.num_envs,), self.reward_step, device=self.device, dtype=torch.float)
         rewards[collided] = self.reward_collision
         goal_reached = (self.agent_pos == self.end_pos).all(dim=1)
@@ -114,7 +101,6 @@ class VectorizedGridWorldEnv:
         self.agent_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device); self.start_pos[mask]=self.agent_pos[mask].clone(); self.end_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device)
         env_idx=torch.arange(self.num_envs,device=self.device)[mask]; self.grids[env_idx,self.start_pos[mask,0],self.start_pos[mask,1]]=stoi['S']; self.grids[env_idx,self.end_pos[mask,0],self.end_pos[mask,1]]=stoi['E']
 
-# (Other helper functions like generate_bfs_transitions remain unchanged)
 def generate_bfs_transitions(grids, goals):
     num_envs, grid_size, _ = grids.shape; transitions = []
     obs_channel = grids.clone(); scratch_channel = torch.full_like(obs_channel, bfs_stoi['UKN'])
@@ -131,6 +117,7 @@ def generate_bfs_transitions(grids, goals):
         target_board = torch.stack([obs_channel, scratch_channel.clone()], dim=1)
         if not torch.equal(input_board, target_board): transitions.append((input_board, target_board))
     return transitions
+
 # ============================================================================
 # Model Architecture
 # ============================================================================
@@ -162,7 +149,6 @@ class UnifiedModel(nn.Module):
         self.obs_embedding=nn.Embedding(len(model_config['vocab']),d_model); self.scratch_embedding=nn.Embedding(len(BFS_VOCAB),d_model); self.channel_embedding=nn.Embedding(2,d_model)
         self.rope=RotaryPositionalEmbedding2D(d_model,self.grid_size,model_config['rope_theta']); encoder_layer=RoPETransformerEncoderLayer(d_model,model_config['nhead'],dim_feedforward,model_config['dropout'],batch_first=True); self.transformer=nn.TransformerEncoder(encoder_layer,model_config['num_layers'])
         self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB))
-        # MODIFICATION: Renamed actor_head to nav_head for clarity and adjusted output size for IDLE action.
         self.nav_head=nn.Linear(d_model,model_config['num_actions'])
     def _get_base_output(self,dual_channel_board):
         B,C,H,W=dual_channel_board.shape
@@ -173,211 +159,45 @@ class UnifiedModel(nn.Module):
         for layer in self.transformer.layers: x=layer(x,pos_ids=pos_ids,rope=self.rope)
         return x
     
-    # MODIFICATION: The forward pass now handles three distinct modes.
     def forward(self, dual_channel_board, mode, nav_action=None, bfs_action=None, deterministic=False):
         base_output = self._get_base_output(dual_channel_board)
         
-        # Mode 1: Pre-training the BFS head (unchanged)
         if mode == 'bfs_predict':
             scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
             return self.bfs_head(scratchpad_tokens_out)
 
-        # Mode 2: RL Rollout - Sample joint actions
         elif mode == 'rl_rollout':
-            # Navigation Head
             cls_rep = base_output.mean(dim=1)
             nav_logits = self.nav_head(cls_rep)
             nav_dist = torch.distributions.Categorical(logits=nav_logits)
             sampled_nav_action = torch.argmax(nav_logits, dim=-1) if deterministic else nav_dist.sample()
             
-            # BFS Head
             scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
             bfs_logits = self.bfs_head(scratchpad_tokens_out)
             bfs_dist = torch.distributions.Categorical(logits=bfs_logits)
-            sampled_bfs_action = bfs_dist.sample() # Shape: (B, H*W)
+            sampled_bfs_action = bfs_dist.sample()
 
             return sampled_nav_action, sampled_bfs_action, nav_dist, bfs_dist
 
-        # Mode 3: RL Update - Calculate log_probs and entropy for stored actions
         elif mode == 'rl_update':
-            # Navigation Head
             cls_rep = base_output.mean(dim=1)
             nav_logits = self.nav_head(cls_rep)
             nav_dist = torch.distributions.Categorical(logits=nav_logits)
             nav_log_prob = nav_dist.log_prob(nav_action)
             nav_entropy = nav_dist.entropy()
 
-            # BFS Head
             scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
             bfs_logits = self.bfs_head(scratchpad_tokens_out)
             bfs_dist = torch.distributions.Categorical(logits=bfs_logits)
-            bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1) # Sum log_probs across all grid cells
-            bfs_entropy = bfs_dist.entropy().sum(dim=-1) # Sum entropy across all grid cells
+            bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1)
+            bfs_entropy = bfs_dist.entropy().sum(dim=-1)
             
-            return nav_log_prob + bfs_log_prob, nav_entropy + bfs_entropy
+            # MODIFICATION: Return entropies separately for diagnostics
+            return nav_log_prob + bfs_log_prob, nav_entropy, bfs_entropy
 
 # ============================================================================
 # Training & Evaluation
 # ============================================================================
-# MODIFICATION: Evaluation logic is updated for the new dynamic, joint-action policy.
-def evaluate_rl_navigation(agent, device, eval_episodes, **kwargs):
-    print("  --- Running RL Validation ---")
-    eval_env = VectorizedGridWorldEnv(eval_episodes, device, **CONFIG['env'], **CONFIG['shared'])
-    obs_state = eval_env.reset()
-    
-    # Initialize scratchpad
-    grid_size = eval_env.grid_size
-    scratchpad = torch.full((eval_episodes, grid_size, grid_size), bfs_stoi['UKN'], device=device)
-    scratchpad[torch.arange(eval_episodes), eval_env.end_pos[:, 0], eval_env.end_pos[:, 1]] = bfs_stoi['0']
-    scratchpad[eval_env.grids == stoi['#']] = bfs_stoi['INF']
-
-    active = torch.ones(eval_episodes, dtype=torch.bool, device=device)
-    ep_lengths = torch.zeros(eval_episodes, device=device)
-    successes, total_len, total_shortest = 0, 0, 0
-    start_pos, end_pos = eval_env.start_pos.clone(), eval_env.end_pos.clone()
-
-    for _ in range(eval_env.max_steps):
-        with torch.no_grad():
-            with autocast(device_type='cuda', enabled=use_amp):
-                current_board_state = torch.stack([obs_state, scratchpad], dim=1)
-                nav_actions, bfs_actions, _, _ = agent(current_board_state, mode='rl_rollout', deterministic=True)
-                scratchpad = bfs_actions.view(eval_episodes, grid_size, grid_size)
-        
-        obs_state, _, dones, goal_reached = eval_env.step(nav_actions)
-        ep_lengths[active] += 1
-        
-        # For any env that just finished, reset its scratchpad
-        if dones.any():
-            scratchpad[dones] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
-            scratchpad[dones, eval_env.end_pos[dones, 0], eval_env.end_pos[dones, 1]] = bfs_stoi['0']
-            scratchpad[dones] = torch.where(eval_env.grids[dones] == stoi['#'], bfs_stoi['INF'], scratchpad[dones])
-
-        finished = torch.where(goal_reached & active)[0]
-        if len(finished) > 0:
-            successes += len(finished)
-            for i in finished:
-                total_len += ep_lengths[i].item()
-                total_shortest += torch.abs(start_pos[i] - end_pos[i]).sum().item()
-            active[finished] = False
-        if not active.any(): break
-            
-    return {'success_rate': (successes/eval_episodes)*100, 'avg_len': total_len/successes if successes > 0 else float('nan'), 'efficiency': total_len/max(1, total_shortest) if successes > 0 else float('nan')}
-
-# MODIFICATION: The main RL training loop is overhauled to handle the joint action space.
-def train_rl_navigation(agent, env, device, val_transitions, **rl_config):
-    print("\n=== Starting Phase 2: Learning to Act & Plan ===\n")
-    optimizer = optim.AdamW(agent.parameters(), lr=rl_config['learning_rate'], eps=rl_config['optimizer_eps'])
-    num_updates = rl_config['total_timesteps'] // (rl_config['num_envs'] * rl_config['steps_per_update'])
-    grid_size = env.grid_size; grpo_params = CONFIG['grpo']
-    scaler = GradScaler('cuda', enabled=use_amp)
-    
-    # Buffer setup
-    steps_per_update, num_envs = rl_config['steps_per_update'], rl_config['num_envs']
-    states_buffer = torch.zeros((steps_per_update, num_envs, 2, grid_size, grid_size), dtype=torch.long, device=device)
-    nav_actions_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.long, device=device)
-    bfs_actions_buffer = torch.zeros((steps_per_update, num_envs, grid_size * grid_size), dtype=torch.long, device=device)
-    log_probs_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
-    rewards_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
-    terminals_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.bool, device=device)
-
-    # Initial state
-    obs_state = env.reset()
-    scratchpad_state = torch.full((num_envs, grid_size, grid_size), bfs_stoi['UKN'], device=device)
-    scratchpad_state[torch.arange(num_envs), env.end_pos[:, 0], env.end_pos[:, 1]] = bfs_stoi['0']
-    scratchpad_state[env.grids == stoi['#']] = bfs_stoi['INF']
-
-    for update in range(1, num_updates + 1):
-        for step in range(steps_per_update):
-            with torch.no_grad():
-                with autocast(device_type='cuda', enabled=use_amp):
-                    current_board_state = torch.stack([obs_state, scratchpad_state], dim=1)
-                    
-                    # Sample joint action from the policy
-                    nav_action, bfs_action, nav_dist, bfs_dist = agent(current_board_state, mode='rl_rollout')
-                    
-                    # Calculate joint log probability for the sampled actions
-                    nav_log_prob = nav_dist.log_prob(nav_action)
-                    bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1)
-                    joint_log_prob = nav_log_prob + bfs_log_prob
-            
-            # Store rollout data
-            states_buffer[step] = current_board_state
-            nav_actions_buffer[step] = nav_action
-            bfs_actions_buffer[step] = bfs_action
-            log_probs_buffer[step] = joint_log_prob
-            
-            # Step environment and update states
-            next_obs_state, reward, done, _ = env.step(nav_action)
-            rewards_buffer[step] = reward
-            terminals_buffer[step] = done
-            
-            obs_state = next_obs_state
-            scratchpad_state = bfs_action.view(num_envs, grid_size, grid_size)
-            
-            # Reset scratchpad for environments that are done
-            if done.any():
-                scratchpad_state[done] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
-                scratchpad_state[done, env.end_pos[done, 0], env.end_pos[done, 1]] = bfs_stoi['0']
-                scratchpad_state[done] = torch.where(env.grids[done] == stoi['#'], bfs_stoi['INF'], scratchpad_state[done])
-
-        # Advantage calculation (remains the same)
-        with torch.no_grad():
-            returns = torch.zeros_like(rewards_buffer)
-            for t in reversed(range(steps_per_update)):
-                next_return = returns[t+1] if t < steps_per_update - 1 else 0
-                returns[t] = rewards_buffer[t] + grpo_params['gamma'] * next_return * (1.0 - terminals_buffer[t].float())
-            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-        
-        # Prepare batches for update
-        b_size = num_envs * steps_per_update
-        b_states = states_buffer.reshape(b_size, 2, grid_size, grid_size)
-        b_nav_actions = nav_actions_buffer.reshape(b_size)
-        b_bfs_actions = bfs_actions_buffer.reshape(b_size, grid_size * grid_size)
-        b_log_probs = log_probs_buffer.reshape(b_size)
-        b_advantages = advantages.reshape(b_size)
-        b_inds = np.arange(b_size)
-        pg_losses, ent_losses = [], []
-        
-        # GPRO Update Loop
-        for _ in range(rl_config['epochs_per_update']):
-            np.random.shuffle(b_inds)
-            for start in range(0, b_size, rl_config['minibatch_size']):
-                mb_inds = b_inds[start:start + rl_config['minibatch_size']]
-                optimizer.zero_grad()
-                with autocast(device_type='cuda', enabled=use_amp):
-                    # Get new log_probs and entropy for the joint action
-                    new_joint_log_prob, new_joint_entropy = agent(
-                        b_states[mb_inds], mode='rl_update', 
-                        nav_action=b_nav_actions[mb_inds], 
-                        bfs_action=b_bfs_actions[mb_inds]
-                    )
-                    ratio = torch.exp(new_joint_log_prob - b_log_probs[mb_inds])
-                    pg_loss1 = -b_advantages[mb_inds] * ratio
-                    pg_loss2 = -b_advantages[mb_inds] * torch.clamp(ratio, 1 - grpo_params['clip_eps'], 1 + grpo_params['clip_eps'])
-                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    ent_loss = new_joint_entropy.mean()
-                    loss = pg_loss - grpo_params['entropy_coef'] * ent_loss
-                
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(agent.parameters(), rl_config['grad_clip_norm'])
-                scaler.step(optimizer)
-                scaler.update()
-                pg_losses.append(pg_loss.item()); ent_losses.append(ent_loss.item())
-
-        if update % CONFIG['logging']['log_interval'] == 0:
-            print(f"RL Update {update}/{num_updates}")
-            print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
-            if update % CONFIG['logging']['eval_interval'] == 0:
-                rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'])
-                print(f"  RL Validation -> Success: {rl_metrics['success_rate']:.1f}% | Length: {rl_metrics['avg_len']:.1f} | Efficiency: {rl_metrics['efficiency']:.2f}")
-                # We can still validate the BFS head's accuracy against the ground truth pre-training data
-                bfs_metrics = validate_bfs_prediction(agent, val_transitions, CONFIG['bfs_prediction']['batch_size'], device)
-                print(f"  BFS Head Validation -> Accuracy: {bfs_metrics['accuracy']:.2f}%")
-            print()
-    print("RL Training complete!")
-
-# (The `train_bfs_prediction` and `validate_bfs_prediction` functions remain unchanged)
 def validate_bfs_prediction(agent, validation_data, batch_size, device):
     agent.eval(); total_loss=0; correct_cells=0; total_cells=0; loss_fn=nn.CrossEntropyLoss()
     with torch.no_grad():
@@ -419,8 +239,198 @@ def train_bfs_prediction(agent, device, **kwargs):
             print(f"  Validation -> Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%\n")
     print("\nBFS Pre-training complete!\n"); return val_transitions
 
+def evaluate_rl_navigation(agent, device, eval_episodes, **kwargs):
+    print("  --- Running RL Validation ---")
+    eval_env = VectorizedGridWorldEnv(eval_episodes, device, **CONFIG['env'], **CONFIG['shared'])
+    obs_state = eval_env.reset()
+    
+    grid_size = eval_env.grid_size
+    scratchpad = torch.full((eval_episodes, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+    scratchpad[torch.arange(eval_episodes), eval_env.end_pos[:, 0], eval_env.end_pos[:, 1]] = bfs_stoi['0']
+    scratchpad[eval_env.grids == stoi['#']] = bfs_stoi['INF']
 
-# (Main execution and inference functions are updated to reflect the new API)
+    active = torch.ones(eval_episodes, dtype=torch.bool, device=device)
+    ep_lengths = torch.zeros(eval_episodes, device=device)
+    successes, total_len, total_shortest = 0, 0, 0
+    start_pos, end_pos = eval_env.start_pos.clone(), eval_env.end_pos.clone()
+    
+    # MODIFICATION: Add list to collect actions for diagnostics
+    collected_actions = []
+
+    for _ in range(eval_env.max_steps):
+        with torch.no_grad():
+            with autocast(device_type='cuda', enabled=use_amp):
+                current_board_state = torch.stack([obs_state, scratchpad], dim=1)
+                nav_actions, bfs_actions, _, _ = agent(current_board_state, mode='rl_rollout', deterministic=True)
+                scratchpad = bfs_actions.view(eval_episodes, grid_size, grid_size)
+                collected_actions.append(nav_actions)
+        
+        obs_state, _, dones, goal_reached = eval_env.step(nav_actions)
+        ep_lengths[active] += 1
+        
+        if dones.any():
+            scratchpad[dones] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+            scratchpad[dones, eval_env.end_pos[dones, 0], eval_env.end_pos[dones, 1]] = bfs_stoi['0']
+            scratchpad[dones] = torch.where(eval_env.grids[dones] == stoi['#'], bfs_stoi['INF'], scratchpad[dones])
+
+        finished = torch.where(goal_reached & active)[0]
+        if len(finished) > 0:
+            successes += len(finished)
+            for i in finished:
+                total_len += ep_lengths[i].item()
+                total_shortest += torch.abs(start_pos[i] - end_pos[i]).sum().item()
+            active[finished] = False
+        if not active.any(): break
+            
+    # MODIFICATION: Print action distribution diagnostic
+    if collected_actions:
+        all_actions = torch.cat(collected_actions).cpu().numpy()
+        action_counts = {i: np.count_nonzero(all_actions == i) for i in range(CONFIG['shared']['num_actions'])}
+        total_actions = len(all_actions)
+        action_names = {0: "U", 1: "D", 2: "L", 3: "R", 4: "IDLE"}
+        action_dist_str = " | ".join([f"{action_names.get(k, k)}: {v/total_actions:.1%}" for k, v in action_counts.items()])
+        print(f"  Eval Action Dist: [ {action_dist_str} ]")
+    
+    return {'success_rate': (successes/eval_episodes)*100, 'avg_len': total_len/successes if successes > 0 else float('nan'), 'efficiency': total_len/max(1, total_shortest) if successes > 0 else float('nan')}
+
+def train_rl_navigation(agent, env, device, val_transitions, **rl_config):
+    print("\n=== Starting Phase 2: Learning to Act & Plan ===\n")
+    
+    fine_tune_lr = rl_config['learning_rate'] / 10
+    nav_head_params = list(agent.nav_head.parameters())
+    pretrained_params = [p for n, p in agent.named_parameters() if "nav_head" not in n]
+    optimizer_params = [
+        {'params': nav_head_params, 'lr': rl_config['learning_rate']},
+        {'params': pretrained_params, 'lr': fine_tune_lr}
+    ]
+    optimizer = optim.AdamW(optimizer_params, eps=rl_config['optimizer_eps'])
+    
+    num_updates = rl_config['total_timesteps'] // (rl_config['num_envs'] * rl_config['steps_per_update'])
+    grid_size = env.grid_size; 
+    grpo_params = CONFIG['grpo']
+    env_params = CONFIG['env']
+    scaler = GradScaler('cuda', enabled=use_amp)
+    
+    steps_per_update, num_envs = rl_config['steps_per_update'], rl_config['num_envs']
+    states_buffer = torch.zeros((steps_per_update, num_envs, 2, grid_size, grid_size), dtype=torch.long, device=device)
+    nav_actions_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.long, device=device)
+    bfs_actions_buffer = torch.zeros((steps_per_update, num_envs, grid_size * grid_size), dtype=torch.long, device=device)
+    log_probs_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
+    rewards_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
+    terminals_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.bool, device=device)
+
+    obs_state = env.reset()
+    scratchpad_state = torch.full((num_envs, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+    scratchpad_state[torch.arange(num_envs), env.end_pos[:, 0], env.end_pos[:, 1]] = bfs_stoi['0']
+    scratchpad_state[env.grids == stoi['#']] = bfs_stoi['INF']
+    
+    # MODIFICATION: Initialize state tracker for the format reward
+    has_started_acting = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    IDLE_ACTION = CONFIG['shared']['num_actions'] - 1
+
+    for update in range(1, num_updates + 1):
+        for step in range(steps_per_update):
+            with torch.no_grad():
+                with autocast(device_type='cuda', enabled=use_amp):
+                    current_board_state = torch.stack([obs_state, scratchpad_state], dim=1)
+                    nav_action, bfs_action, nav_dist, bfs_dist = agent(current_board_state, mode='rl_rollout')
+                    nav_log_prob = nav_dist.log_prob(nav_action)
+                    bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1)
+                    joint_log_prob = nav_log_prob + bfs_log_prob
+            
+            # --- START: Format Reward Logic ---
+            is_move = (nav_action != IDLE_ACTION)
+            is_idle = ~is_move
+            # A violation occurs if an agent is IDLE after it has already started the ACTING phase.
+            format_violation = has_started_acting & is_idle
+            # Update the state for the next step: once an agent moves, it's in the acting phase.
+            has_started_acting |= is_move
+            # --- END: Format Reward Logic ---
+            
+            states_buffer[step] = current_board_state
+            nav_actions_buffer[step] = nav_action
+            bfs_actions_buffer[step] = bfs_action
+            log_probs_buffer[step] = joint_log_prob
+            
+            next_obs_state, reward, done, _ = env.step(nav_action)
+            
+            # Apply the format penalty to the reward from the environment
+            reward[format_violation] += env_params['format_penalty']
+            
+            rewards_buffer[step] = reward
+            terminals_buffer[step] = done
+            
+            obs_state = next_obs_state
+            scratchpad_state = bfs_action.view(num_envs, grid_size, grid_size)
+            
+            if done.any():
+                # Reset the format state for environments that are finished
+                has_started_acting[done] = False
+                
+                # Reset scratchpad for environments that are done
+                scratchpad_state[done] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+                scratchpad_state[done, env.end_pos[done, 0], env.end_pos[done, 1]] = bfs_stoi['0']
+                scratchpad_state[done] = torch.where(env.grids[done] == stoi['#'], bfs_stoi['INF'], scratchpad_state[done])
+
+        with torch.no_grad():
+            returns = torch.zeros_like(rewards_buffer)
+            for t in reversed(range(steps_per_update)):
+                next_return = returns[t+1] if t < steps_per_update - 1 else 0
+                returns[t] = rewards_buffer[t] + grpo_params['gamma'] * next_return * (1.0 - terminals_buffer[t].float())
+            advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
+        
+        b_size = num_envs * steps_per_update
+        b_states = states_buffer.reshape(b_size, 2, grid_size, grid_size)
+        b_nav_actions = nav_actions_buffer.reshape(b_size)
+        b_bfs_actions = bfs_actions_buffer.reshape(b_size, grid_size * grid_size)
+        b_log_probs = log_probs_buffer.reshape(b_size)
+        b_advantages = advantages.reshape(b_size)
+        b_inds = np.arange(b_size)
+        
+        pg_losses, nav_ent_losses, bfs_ent_losses = [], [], []
+        
+        for _ in range(rl_config['epochs_per_update']):
+            np.random.shuffle(b_inds)
+            for start in range(0, b_size, rl_config['minibatch_size']):
+                mb_inds = b_inds[start:start + rl_config['minibatch_size']]
+                optimizer.zero_grad()
+                with autocast(device_type='cuda', enabled=use_amp):
+                    new_joint_log_prob, new_nav_entropy, new_bfs_entropy = agent(
+                        b_states[mb_inds], mode='rl_update', 
+                        nav_action=b_nav_actions[mb_inds], 
+                        bfs_action=b_bfs_actions[mb_inds]
+                    )
+                    ratio = torch.exp(new_joint_log_prob - b_log_probs[mb_inds])
+                    pg_loss1 = -b_advantages[mb_inds] * ratio
+                    pg_loss2 = -b_advantages[mb_inds] * torch.clamp(ratio, 1 - grpo_params['clip_eps'], 1 + grpo_params['clip_eps'])
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+                    
+                    nav_ent_loss = new_nav_entropy.mean()
+                    bfs_ent_loss = new_bfs_entropy.mean()
+                    ent_loss = nav_ent_loss + bfs_ent_loss
+                    
+                    loss = pg_loss - grpo_params['entropy_coef'] * ent_loss
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(agent.parameters(), rl_config['grad_clip_norm'])
+                scaler.step(optimizer)
+                scaler.update()
+                pg_losses.append(pg_loss.item())
+                nav_ent_losses.append(nav_ent_loss.item())
+                bfs_ent_losses.append(bfs_ent_loss.item())
+
+        if update % CONFIG['logging']['log_interval'] == 0:
+            print(f"RL Update {update}/{num_updates}")
+            print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Nav Entropy: {np.mean(nav_ent_losses):.2f} | BFS Entropy: {np.mean(bfs_ent_losses):.2f}")
+            if update % CONFIG['logging']['eval_interval'] == 0:
+                rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'])
+                print(f"  RL Validation -> Success: {rl_metrics['success_rate']:.1f}% | Length: {rl_metrics['avg_len']:.1f} | Efficiency: {rl_metrics['efficiency']:.2f}")
+                bfs_metrics = validate_bfs_prediction(agent, val_transitions, CONFIG['bfs_prediction']['batch_size'], device)
+                print(f"  BFS Head Validation -> Accuracy: {bfs_metrics['accuracy']:.2f}%")
+            print()
+    print("RL Training complete!")
+
 def infer(agent,device,**kwargs):
     print("\n=== Inference ==="); infer_env = VectorizedGridWorldEnv(1, device, **CONFIG['env'], **CONFIG['shared'])
     obs_state = infer_env.reset(); grid_size=infer_env.grid_size

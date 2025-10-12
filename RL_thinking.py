@@ -6,22 +6,19 @@ import collections
 import time
 from torch.amp import autocast, GradScaler
 
-
-# MODIFICATION END
-
 # ============================================================================
 # Hierarchical Configuration
 # ============================================================================
 CONFIG = {
     'shared': {
-        'grid_size': 12, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 4,
+        'grid_size': 8, 'vocab': [' ', '#', 'S', 'E', 'A'], 'num_actions': 5, # 4 directions + 1 idle
     },
     'env': {
-        'wall_density': 1.5, 'max_episode_steps_multiplier': 5,
+        'wall_density': 1.2, 'max_episode_steps_multiplier': 5,
         'reward_step': -0.01, 'reward_collision': -0.1, 'reward_goal': 1.0,
     },
     'model': {
-        'd_model': 128, 'nhead': 4, 'num_layers': 4,
+        'd_model': 128, 'nhead': 4, 'num_layers': 6,
         'dim_feedforward_multiplier': 2, 'dropout': 0.1, 'rope_theta': 10000.0,
     },
     'bfs_prediction': {
@@ -29,34 +26,81 @@ CONFIG = {
         'val_interval': 100,
     },
     'rl_navigation': {
-        'total_timesteps': 1_000_000, 'num_envs': 64, 'steps_per_update': 64,
+        'total_timesteps': 400_000, 'num_envs': 64, 'steps_per_update': 64,
         'learning_rate': 1e-4, 'optimizer_eps': 1e-8, 'grad_clip_norm': 0.5,
-        'epochs_per_update': 4, 'minibatch_size': 256, 'thinking_steps': 12,
+        'epochs_per_update': 4, 'minibatch_size': 256,
     },
-    'grpo': { # Using GRPO-style clipping and advantage
+    'grpo': {
         'gamma': 0.99, 'clip_eps': 0.2, 'entropy_coef': 0.01,
     },
     'logging': {
-        'log_interval':10, 'eval_interval': 10, 'eval_episodes': 512,
+        'log_interval':10, 'eval_interval': 10, 'eval_episodes': 256,
     }
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# MODIFICATION START: Flag to enable AMP only on CUDA devices
 use_amp = torch.cuda.is_available()
 print(f"Using device: {device} | Mixed Precision (FP16) Enabled: {use_amp}\n")
-# MODIFICATION END
 
-
-# Vocabs
+# Vocabs & Mappings
 BFS_VOCAB = [str(i) for i in range(100)] + ['INF', 'UKN']
 bfs_stoi = {c: i for i, c in enumerate(BFS_VOCAB)}; bfs_itos = {i: c for i, c in enumerate(BFS_VOCAB)}
 def get_char_mappings(vocab): return {c: i for i, c in enumerate(vocab)}, {i: c for i, c in enumerate(vocab)}
 stoi, itos = get_char_mappings(CONFIG['shared']['vocab'])
 
 # ============================================================================
-# Data Generation & Environment
+# Environment
 # ============================================================================
+class VectorizedGridWorldEnv:
+    def __init__(self, num_envs, device, **kwargs):
+        self.num_envs=num_envs; self.device=device; self.grid_size=kwargs['grid_size']; self.wall_density=kwargs['wall_density']; self.max_steps=kwargs['grid_size']*kwargs['max_episode_steps_multiplier']
+        self.reward_step=kwargs['reward_step']; self.reward_collision=kwargs['reward_collision']; self.reward_goal=kwargs['reward_goal']
+        self.grids=torch.full((num_envs,kwargs['grid_size'],kwargs['grid_size']),stoi[' '],dtype=torch.long,device=device); self.agent_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device)
+        self.start_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device); self.end_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device)
+        self.episode_steps=torch.zeros(num_envs,dtype=torch.long,device=device)
+    def reset(self): self._reset_envs(torch.ones(self.num_envs,dtype=torch.bool,device=self.device)); return self.get_state()
+    def get_state(self):
+        state=self.grids.clone(); state[(state==stoi['S'])|(state==stoi['E'])|(state==stoi['A'])]=stoi[' ']
+        agent_moved=(self.agent_pos!=self.start_pos).any(dim=1)
+        if agent_moved.any(): envs=torch.where(agent_moved)[0]; state[envs,self.start_pos[envs,0],self.start_pos[envs,1]]=stoi['S']
+        env_idx=torch.arange(self.num_envs,device=self.device); state[env_idx,self.end_pos[:,0],self.end_pos[:,1]]=stoi['E']; state[env_idx,self.agent_pos[:,0],self.agent_pos[:,1]]=stoi['A']
+        return state
+    def step(self,actions):
+        self.episode_steps+=1
+        IDLE_ACTION = CONFIG['shared']['num_actions'] - 1
+        is_move = actions != IDLE_ACTION
+        next_pos = self.agent_pos.clone()
+        move_indices = torch.where(is_move)[0]
+        if len(move_indices) > 0:
+            move_actions = actions[move_indices]
+            temp_pos = self.agent_pos[move_indices].clone()
+            temp_pos[move_actions == 0, 0] -= 1; temp_pos[move_actions == 1, 0] += 1
+            temp_pos[move_actions == 2, 1] -= 1; temp_pos[move_actions == 3, 1] += 1
+            next_pos[move_indices] = temp_pos
+        out_of_bounds = ((next_pos < 0) | (next_pos >= self.grid_size)).any(dim=1)
+        wall_collision = torch.zeros_like(out_of_bounds)
+        valid_pos_check_indices = torch.where(~out_of_bounds & is_move)[0]
+        if len(valid_pos_check_indices) > 0:
+            valid_pos = next_pos[valid_pos_check_indices]
+            wall_collision[valid_pos_check_indices] = self.grids[valid_pos_check_indices, valid_pos[:, 0], valid_pos[:, 1]] == stoi['#']
+        collided = (out_of_bounds | wall_collision) & is_move
+        valid_moves = ~collided
+        self.agent_pos[valid_moves] = next_pos[valid_moves]
+        rewards = torch.full((self.num_envs,), self.reward_step, device=self.device, dtype=torch.float)
+        rewards[collided] = self.reward_collision
+        goal_reached = (self.agent_pos == self.end_pos).all(dim=1)
+        rewards[goal_reached] = self.reward_goal
+        timeout = self.episode_steps >= self.max_steps; dones = goal_reached | timeout
+        if dones.any(): self._reset_envs(dones)
+        return self.get_state(),rewards,dones,goal_reached
+    def _reset_envs(self,mask):
+        num_reset=mask.sum().item()
+        if num_reset==0: return
+        self.episode_steps[mask]=0; self.grids[mask]=stoi[' ']; num_walls=int(self.grid_size*self.wall_density)
+        for _ in range(num_walls): coords=torch.randint(0,self.grid_size,(num_reset,2),device=self.device); self.grids[mask,coords[:,0],coords[:,1]]=stoi['#']
+        self.agent_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device); self.start_pos[mask]=self.agent_pos[mask].clone(); self.end_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device)
+        env_idx=torch.arange(self.num_envs,device=self.device)[mask]; self.grids[env_idx,self.start_pos[mask,0],self.start_pos[mask,1]]=stoi['S']; self.grids[env_idx,self.end_pos[mask,0],self.end_pos[mask,1]]=stoi['E']
+
 def generate_bfs_transitions(grids, goals):
     num_envs, grid_size, _ = grids.shape; transitions = []
     obs_channel = grids.clone(); scratch_channel = torch.full_like(obs_channel, bfs_stoi['UKN'])
@@ -74,39 +118,8 @@ def generate_bfs_transitions(grids, goals):
         if not torch.equal(input_board, target_board): transitions.append((input_board, target_board))
     return transitions
 
-class VectorizedGridWorldEnv:
-    def __init__(self, num_envs, device, **kwargs):
-        self.num_envs=num_envs; self.device=device; self.grid_size=kwargs['grid_size']; self.wall_density=kwargs['wall_density']; self.max_steps=kwargs['grid_size']*kwargs['max_episode_steps_multiplier']
-        self.reward_step=kwargs['reward_step']; self.reward_collision=kwargs['reward_collision']; self.reward_goal=kwargs['reward_goal']
-        self.grids=torch.full((num_envs,kwargs['grid_size'],kwargs['grid_size']),stoi[' '],dtype=torch.long,device=device); self.agent_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device)
-        self.start_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device); self.end_pos=torch.zeros((num_envs,2),dtype=torch.long,device=device)
-        self.episode_steps=torch.zeros(num_envs,dtype=torch.long,device=device)
-    def reset(self): self._reset_envs(torch.ones(self.num_envs,dtype=torch.bool,device=self.device)); return self.get_state()
-    def get_state(self):
-        state=self.grids.clone(); state[(state==stoi['S'])|(state==stoi['E'])|(state==stoi['A'])]=stoi[' ']
-        agent_moved=(self.agent_pos!=self.start_pos).any(dim=1)
-        if agent_moved.any(): envs=torch.where(agent_moved)[0]; state[envs,self.start_pos[envs,0],self.start_pos[envs,1]]=stoi['S']
-        env_idx=torch.arange(self.num_envs,device=self.device); state[env_idx,self.end_pos[:,0],self.end_pos[:,1]]=stoi['E']; state[env_idx,self.agent_pos[:,0],self.agent_pos[:,1]]=stoi['A']
-        return state
-    def step(self,actions):
-        self.episode_steps+=1; next_pos=self.agent_pos.clone(); next_pos[actions==0,0]-=1; next_pos[actions==1,0]+=1; next_pos[actions==2,1]-=1; next_pos[actions==3,1]+=1
-        out_of_bounds=((next_pos<0)|(next_pos>=self.grid_size)).any(dim=1); wall_collision=torch.zeros_like(out_of_bounds); valid_idx=torch.where(~out_of_bounds)[0]
-        if len(valid_idx)>0: valid_pos=next_pos[valid_idx]; wall_collision[valid_idx]=self.grids[valid_idx,valid_pos[:,0],valid_pos[:,1]]==stoi['#']
-        valid_moves=~(out_of_bounds|wall_collision); self.agent_pos[valid_moves]=next_pos[valid_moves]; rewards=torch.full((self.num_envs,),self.reward_step,device=self.device,dtype=torch.float)
-        rewards[~valid_moves]=self.reward_collision; goal_reached=(self.agent_pos==self.end_pos).all(dim=1); rewards[goal_reached]=self.reward_goal
-        timeout=self.episode_steps>=self.max_steps; dones=goal_reached|timeout
-        if dones.any(): self._reset_envs(dones)
-        return self.get_state(),rewards,dones,goal_reached
-    def _reset_envs(self,mask):
-        num_reset=mask.sum().item()
-        if num_reset==0: return
-        self.episode_steps[mask]=0; self.grids[mask]=stoi[' ']; num_walls=int(self.grid_size*self.wall_density)
-        for _ in range(num_walls): coords=torch.randint(0,self.grid_size,(num_reset,2),device=self.device); self.grids[mask,coords[:,0],coords[:,1]]=stoi['#']
-        self.agent_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device); self.start_pos[mask]=self.agent_pos[mask].clone(); self.end_pos[mask]=torch.randint(0,self.grid_size,(num_reset,2),device=self.device)
-        env_idx=torch.arange(self.num_envs,device=self.device)[mask]; self.grids[env_idx,self.start_pos[mask,0],self.start_pos[mask,1]]=stoi['S']; self.grids[env_idx,self.end_pos[mask,0],self.end_pos[mask,1]]=stoi['E']
-
 # ============================================================================
-# Model Architecture 
+# Model Architecture
 # ============================================================================
 class RotaryPositionalEmbedding2D(nn.Module):
     def __init__(self,d_model,grid_size,rope_theta):
@@ -135,7 +148,8 @@ class UnifiedModel(nn.Module):
         super().__init__(); self.grid_size=model_config['grid_size']; d_model=model_config['d_model']; dim_feedforward=d_model*model_config['dim_feedforward_multiplier']
         self.obs_embedding=nn.Embedding(len(model_config['vocab']),d_model); self.scratch_embedding=nn.Embedding(len(BFS_VOCAB),d_model); self.channel_embedding=nn.Embedding(2,d_model)
         self.rope=RotaryPositionalEmbedding2D(d_model,self.grid_size,model_config['rope_theta']); encoder_layer=RoPETransformerEncoderLayer(d_model,model_config['nhead'],dim_feedforward,model_config['dropout'],batch_first=True); self.transformer=nn.TransformerEncoder(encoder_layer,model_config['num_layers'])
-        self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB)); self.actor_head=nn.Linear(d_model,model_config['num_actions']) 
+        self.bfs_head=nn.Linear(d_model,len(BFS_VOCAB))
+        self.nav_head=nn.Linear(d_model,model_config['num_actions'])
     def _get_base_output(self,dual_channel_board):
         B,C,H,W=dual_channel_board.shape
         obs_flat=dual_channel_board[:,0,:,:].reshape(B,-1); scratch_flat=dual_channel_board[:,1,:,:].reshape(B,-1)
@@ -144,13 +158,42 @@ class UnifiedModel(nn.Module):
         rows=torch.arange(H,device=device).view(1,H,1).expand(B,H,W);cols=torch.arange(W,device=device).view(1,1,W).expand(B,H,W);pos_ids_single=torch.stack([rows,cols],dim=-1).view(B,H*W,2);pos_ids=torch.cat([pos_ids_single,pos_ids_single],dim=1)
         for layer in self.transformer.layers: x=layer(x,pos_ids=pos_ids,rope=self.rope)
         return x
-    def forward(self,dual_channel_board,mode,action=None,deterministic=False):
-        base_output=self._get_base_output(dual_channel_board)
-        if mode=='bfs_predict': scratchpad_tokens_out=base_output[:,self.grid_size*self.grid_size:]; return self.bfs_head(scratchpad_tokens_out)
-        elif mode=='rl_act':
-            cls_rep=base_output.mean(dim=1); logits=self.actor_head(cls_rep); dist=torch.distributions.Categorical(logits=logits)
-            if action is None: action=torch.argmax(logits,dim=-1) if deterministic else dist.sample()
-            return action,dist.log_prob(action),dist.entropy()
+    
+    def forward(self, dual_channel_board, mode, nav_action=None, bfs_action=None, deterministic=False):
+        base_output = self._get_base_output(dual_channel_board)
+        
+        if mode == 'bfs_predict':
+            scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
+            return self.bfs_head(scratchpad_tokens_out)
+
+        elif mode == 'rl_rollout':
+            cls_rep = base_output.mean(dim=1)
+            nav_logits = self.nav_head(cls_rep)
+            nav_dist = torch.distributions.Categorical(logits=nav_logits)
+            sampled_nav_action = torch.argmax(nav_logits, dim=-1) if deterministic else nav_dist.sample()
+            
+            scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
+            bfs_logits = self.bfs_head(scratchpad_tokens_out)
+            bfs_dist = torch.distributions.Categorical(logits=bfs_logits)
+            sampled_bfs_action = bfs_dist.sample()
+
+            return sampled_nav_action, sampled_bfs_action, nav_dist, bfs_dist
+
+        elif mode == 'rl_update':
+            cls_rep = base_output.mean(dim=1)
+            nav_logits = self.nav_head(cls_rep)
+            nav_dist = torch.distributions.Categorical(logits=nav_logits)
+            nav_log_prob = nav_dist.log_prob(nav_action)
+            nav_entropy = nav_dist.entropy()
+
+            scratchpad_tokens_out = base_output[:, self.grid_size*self.grid_size:]
+            bfs_logits = self.bfs_head(scratchpad_tokens_out)
+            bfs_dist = torch.distributions.Categorical(logits=bfs_logits)
+            bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1)
+            bfs_entropy = bfs_dist.entropy().sum(dim=-1)
+            
+            # MODIFICATION: Return entropies separately for diagnostics
+            return nav_log_prob + bfs_log_prob, nav_entropy, bfs_entropy
 
 # ============================================================================
 # Training & Evaluation
@@ -162,21 +205,17 @@ def validate_bfs_prediction(agent, validation_data, batch_size, device):
             batch=validation_data[i:i+batch_size];
             if not batch: continue
             input_boards=torch.cat([t[0] for t in batch]); target_boards=torch.cat([t[1] for t in batch])
-            # MODIFICATION START: Use autocast during validation for consistency
             with autocast(device_type='cuda', enabled=use_amp):
                 logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
                 loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1)); total_loss+=loss.item()
-            # MODIFICATION END
             preds=logits.argmax(dim=-1); target_flat=target_scratchpad.reshape(-1); preds_flat=preds.reshape(-1)
             correct_cells+=(preds_flat==target_flat).sum().item(); total_cells+=target_flat.numel()
     agent.train(); avg_loss=total_loss/max(1,len(validation_data)/batch_size); accuracy=(correct_cells/total_cells)*100
     return {'loss':avg_loss,'accuracy':accuracy}
 
 def train_bfs_prediction(agent, device, **kwargs):
-    print("\n=== Starting Phase 1: Learning to Plan (BFS Prediction) ===\n"); optimizer=optim.AdamW(agent.parameters(),lr=kwargs['learning_rate']); loss_fn=nn.CrossEntropyLoss()
-    # MODIFICATION START: Initialize GradScaler
+    print("\n=== Starting Phase 1: Pre-training the Planner (BFS Prediction) ===\n"); optimizer=optim.AdamW(agent.parameters(),lr=kwargs['learning_rate']); loss_fn=nn.CrossEntropyLoss()
     scaler = GradScaler('cuda', enabled=use_amp)
-    # MODIFICATION END
     env=VectorizedGridWorldEnv(kwargs['batch_size'],device,**CONFIG['env'],**CONFIG['shared']); all_transitions=[]; print("Generating BFS transition data...")
     num_mazes_to_generate=kwargs['total_steps']//env.grid_size
     for _ in range(num_mazes_to_generate//kwargs['batch_size']): env.reset();all_transitions.extend(generate_bfs_transitions(env.grids,env.end_pos))
@@ -187,145 +226,216 @@ def train_bfs_prediction(agent, device, **kwargs):
         batch_start=step*kwargs['batch_size']; batch_end=batch_start+kwargs['batch_size']; batch=train_transitions[batch_start:batch_end]
         if not batch: continue
         input_boards=torch.cat([t[0] for t in batch]);target_boards=torch.cat([t[1] for t in batch])
-        
         optimizer.zero_grad()
-        # MODIFICATION START: Wrap forward pass and loss calculation in autocast
         with autocast(device_type='cuda', enabled=use_amp):
             logits=agent(input_boards,mode='bfs_predict'); target_scratchpad=target_boards[:,1,:,:]
             loss=loss_fn(logits.reshape(-1,len(BFS_VOCAB)),target_scratchpad.reshape(-1))
-        
-        # Scale loss, perform backward pass, and update weights
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        # MODIFICATION END
-
         if(step+1)%kwargs['val_interval']==0:
             val_metrics=validate_bfs_prediction(agent,val_transitions,kwargs['batch_size'],device)
-            print(f"BFS Training Step {(step+1)*kwargs['batch_size']}/{len(train_transitions)}, Train Loss: {loss.item():.4f}")
+            print(f"BFS Pre-training Step {(step+1)*kwargs['batch_size']}/{len(train_transitions)}, Train Loss: {loss.item():.4f}")
             print(f"  Validation -> Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%\n")
-    print("\nBFS Prediction training complete!\n"); return val_transitions
+    print("\nBFS Pre-training complete!\n"); return val_transitions
 
-def evaluate_rl_navigation(agent, device, eval_episodes, thinking_steps, **kwargs):
+def evaluate_rl_navigation(agent, device, eval_episodes, **kwargs):
     print("  --- Running RL Validation ---")
-    eval_env=VectorizedGridWorldEnv(eval_episodes,device,**CONFIG['env'],**CONFIG['shared']); obs_state=eval_env.reset()
-    active=torch.ones(eval_episodes,dtype=torch.bool,device=device); ep_lengths=torch.zeros(eval_episodes,device=device)
-    successes,total_len,total_shortest=0,0,0; start_pos=eval_env.agent_pos.clone(); end_pos=eval_env.end_pos.clone()
+    eval_env = VectorizedGridWorldEnv(eval_episodes, device, **CONFIG['env'], **CONFIG['shared'])
+    obs_state = eval_env.reset()
+    
+    grid_size = eval_env.grid_size
+    scratchpad = torch.full((eval_episodes, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+    scratchpad[torch.arange(eval_episodes), eval_env.end_pos[:, 0], eval_env.end_pos[:, 1]] = bfs_stoi['0']
+    scratchpad[eval_env.grids == stoi['#']] = bfs_stoi['INF']
+
+    active = torch.ones(eval_episodes, dtype=torch.bool, device=device)
+    ep_lengths = torch.zeros(eval_episodes, device=device)
+    successes, total_len, total_shortest = 0, 0, 0
+    start_pos, end_pos = eval_env.start_pos.clone(), eval_env.end_pos.clone()
+    
+    # MODIFICATION: Add list to collect actions for diagnostics
+    collected_actions = []
+
     for _ in range(eval_env.max_steps):
         with torch.no_grad():
-            # MODIFICATION START: Use autocast in evaluation
             with autocast(device_type='cuda', enabled=use_amp):
-                scratchpad=torch.full((eval_episodes,eval_env.grid_size,eval_env.grid_size),bfs_stoi['UKN'],device=device)
-                scratchpad[torch.arange(eval_episodes),end_pos[:,0],end_pos[:,1]]=bfs_stoi['0']; scratchpad[eval_env.grids==stoi['#']]=bfs_stoi['INF']
-                current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-                for _ in range(thinking_steps):
-                    logits=agent(current_board_state,mode='bfs_predict'); preds=logits.argmax(dim=-1)
-                    current_board_state[:,1,:,:]=preds.view(eval_episodes,eval_env.grid_size,eval_env.grid_size)
-                actions=agent(current_board_state,mode='rl_act',deterministic=True)[0]
-            # MODIFICATION END
-        obs_state,_,_,goal_reached=eval_env.step(actions); ep_lengths[active]+=1
-        finished=torch.where(goal_reached&active)[0]
-        if len(finished)>0:
-            successes+=len(finished)
-            for i in finished: total_len+=ep_lengths[i].item(); total_shortest+=torch.abs(start_pos[i]-end_pos[i]).sum().item()
-            active[finished]=False
-        if not active.any():break
-    return {'success_rate':(successes/eval_episodes)*100,'avg_len':total_len/successes if successes>0 else float('nan'),'efficiency':total_len/max(1,total_shortest)if successes>0 else float('nan')}
+                current_board_state = torch.stack([obs_state, scratchpad], dim=1)
+                nav_actions, bfs_actions, _, _ = agent(current_board_state, mode='rl_rollout', deterministic=True)
+                scratchpad = bfs_actions.view(eval_episodes, grid_size, grid_size)
+                collected_actions.append(nav_actions)
+        
+        obs_state, _, dones, goal_reached = eval_env.step(nav_actions)
+        ep_lengths[active] += 1
+        
+        if dones.any():
+            scratchpad[dones] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+            scratchpad[dones, eval_env.end_pos[dones, 0], eval_env.end_pos[dones, 1]] = bfs_stoi['0']
+            scratchpad[dones] = torch.where(eval_env.grids[dones] == stoi['#'], bfs_stoi['INF'], scratchpad[dones])
+
+        finished = torch.where(goal_reached & active)[0]
+        if len(finished) > 0:
+            successes += len(finished)
+            for i in finished:
+                total_len += ep_lengths[i].item()
+                total_shortest += torch.abs(start_pos[i] - end_pos[i]).sum().item()
+            active[finished] = False
+        if not active.any(): break
+            
+    # MODIFICATION: Print action distribution diagnostic
+    if collected_actions:
+        all_actions = torch.cat(collected_actions).cpu().numpy()
+        action_counts = {i: np.count_nonzero(all_actions == i) for i in range(CONFIG['shared']['num_actions'])}
+        total_actions = len(all_actions)
+        action_names = {0: "U", 1: "D", 2: "L", 3: "R", 4: "IDLE"}
+        action_dist_str = " | ".join([f"{action_names.get(k, k)}: {v/total_actions:.1%}" for k, v in action_counts.items()])
+        print(f"  Eval Action Dist: [ {action_dist_str} ]")
+    
+    return {'success_rate': (successes/eval_episodes)*100, 'avg_len': total_len/successes if successes > 0 else float('nan'), 'efficiency': total_len/max(1, total_shortest) if successes > 0 else float('nan')}
 
 def train_rl_navigation(agent, env, device, val_transitions, **rl_config):
-    print("\n=== Starting Phase 2: Learning to Act   ===\n")
-    optimizer=optim.AdamW(agent.parameters(),lr=rl_config['learning_rate'],eps=rl_config['optimizer_eps']);num_updates=rl_config['total_timesteps']//(rl_config['num_envs']*rl_config['steps_per_update']);grid_size=env.grid_size;grpo_params=CONFIG['grpo']
-    # MODIFICATION START: Initialize GradScaler for RL training
+    print("\n=== Starting Phase 2: Learning to Act & Plan ===\n")
+    
+    # MODIFICATION: Use differential learning rates to prevent catastrophic forgetting
+    fine_tune_lr = rl_config['learning_rate'] / 50
+    nav_head_params = list(agent.nav_head.parameters())
+    pretrained_params = [p for n, p in agent.named_parameters() if "nav_head" not in n]
+    optimizer_params = [
+        {'params': nav_head_params, 'lr': rl_config['learning_rate']},
+        {'params': pretrained_params, 'lr': fine_tune_lr}
+    ]
+    optimizer = optim.AdamW(optimizer_params, eps=rl_config['optimizer_eps'])
+    
+    num_updates = rl_config['total_timesteps'] // (rl_config['num_envs'] * rl_config['steps_per_update'])
+    grid_size = env.grid_size; grpo_params = CONFIG['grpo']
     scaler = GradScaler('cuda', enabled=use_amp)
-    # MODIFICATION END
-    buffers=[torch.zeros((rl_config['steps_per_update'],rl_config['num_envs'],*s),dtype=d,device=device)for s,d in[((2,grid_size,grid_size),torch.long),((),torch.long),((),torch.float),((),torch.float),((),torch.bool)]]
-    states_buffer,actions_buffer,log_probs_buffer,rewards_buffer,terminals_buffer=buffers
-    obs_state=env.reset()
-    for update in range(1,num_updates+1):
-        for step in range(rl_config['steps_per_update']):
+    
+    steps_per_update, num_envs = rl_config['steps_per_update'], rl_config['num_envs']
+    states_buffer = torch.zeros((steps_per_update, num_envs, 2, grid_size, grid_size), dtype=torch.long, device=device)
+    nav_actions_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.long, device=device)
+    bfs_actions_buffer = torch.zeros((steps_per_update, num_envs, grid_size * grid_size), dtype=torch.long, device=device)
+    log_probs_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
+    rewards_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.float, device=device)
+    terminals_buffer = torch.zeros((steps_per_update, num_envs), dtype=torch.bool, device=device)
+
+    obs_state = env.reset()
+    scratchpad_state = torch.full((num_envs, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+    scratchpad_state[torch.arange(num_envs), env.end_pos[:, 0], env.end_pos[:, 1]] = bfs_stoi['0']
+    scratchpad_state[env.grids == stoi['#']] = bfs_stoi['INF']
+
+    for update in range(1, num_updates + 1):
+        for step in range(steps_per_update):
             with torch.no_grad():
-                # MODIFICATION START: Use autocast for inference part of RL loop
                 with autocast(device_type='cuda', enabled=use_amp):
-                    scratchpad=torch.full((rl_config['num_envs'],grid_size,grid_size),bfs_stoi['UKN'],device=device)
-                    scratchpad[torch.arange(rl_config['num_envs']),env.end_pos[:,0],env.end_pos[:,1]]=bfs_stoi['0'];scratchpad[env.grids==stoi['#']]=bfs_stoi['INF']
-                    current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-                    for _ in range(rl_config['thinking_steps']):
-                        logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(rl_config['num_envs'],grid_size,grid_size)
-                    states_buffer[step]=current_board_state
-                    action,log_prob,entropy=agent(current_board_state,mode='rl_act')
-                # MODIFICATION END
-            actions_buffer[step]=action;log_probs_buffer[step]=log_prob
-            obs_state,reward,_,terminal=env.step(action);rewards_buffer[step]=reward;terminals_buffer[step]=terminal
-        
-        # advantage calculation
+                    current_board_state = torch.stack([obs_state, scratchpad_state], dim=1)
+                    nav_action, bfs_action, nav_dist, bfs_dist = agent(current_board_state, mode='rl_rollout')
+                    nav_log_prob = nav_dist.log_prob(nav_action)
+                    bfs_log_prob = bfs_dist.log_prob(bfs_action).sum(dim=-1)
+                    joint_log_prob = nav_log_prob + bfs_log_prob
+            
+            states_buffer[step] = current_board_state
+            nav_actions_buffer[step] = nav_action
+            bfs_actions_buffer[step] = bfs_action
+            log_probs_buffer[step] = joint_log_prob
+            
+            next_obs_state, reward, done, _ = env.step(nav_action)
+            rewards_buffer[step] = reward
+            terminals_buffer[step] = done
+            
+            obs_state = next_obs_state
+            scratchpad_state = bfs_action.view(num_envs, grid_size, grid_size)
+            
+            if done.any():
+                scratchpad_state[done] = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+                scratchpad_state[done, env.end_pos[done, 0], env.end_pos[done, 1]] = bfs_stoi['0']
+                scratchpad_state[done] = torch.where(env.grids[done] == stoi['#'], bfs_stoi['INF'], scratchpad_state[done])
+
         with torch.no_grad():
             returns = torch.zeros_like(rewards_buffer)
-            for t in reversed(range(rl_config['steps_per_update'])):
-                if t == rl_config['steps_per_update'] - 1:
-                    next_return = 0 # No next state value
-                else:
-                    next_return = returns[t+1]
+            for t in reversed(range(steps_per_update)):
+                next_return = returns[t+1] if t < steps_per_update - 1 else 0
                 returns[t] = rewards_buffer[t] + grpo_params['gamma'] * next_return * (1.0 - terminals_buffer[t].float())
             advantages = (returns - returns.mean()) / (returns.std() + 1e-8)
-
-        b_states=states_buffer.reshape(-1,2,grid_size,grid_size);b_actions=actions_buffer.reshape(-1);b_log_probs=log_probs_buffer.reshape(-1);b_advantages=advantages.reshape(-1)
-        b_inds=np.arange(rl_config['num_envs']*rl_config['steps_per_update']);pg_losses,ent_losses=[],[]
+        
+        b_size = num_envs * steps_per_update
+        b_states = states_buffer.reshape(b_size, 2, grid_size, grid_size)
+        b_nav_actions = nav_actions_buffer.reshape(b_size)
+        b_bfs_actions = bfs_actions_buffer.reshape(b_size, grid_size * grid_size)
+        b_log_probs = log_probs_buffer.reshape(b_size)
+        b_advantages = advantages.reshape(b_size)
+        b_inds = np.arange(b_size)
+        
+        # MODIFICATION: Separate lists for entropy diagnostics
+        pg_losses, nav_ent_losses, bfs_ent_losses = [], [], []
         
         for _ in range(rl_config['epochs_per_update']):
             np.random.shuffle(b_inds)
-            for start in range(0,len(b_inds),rl_config['minibatch_size']):
-                mb_inds=b_inds[start:start+rl_config['minibatch_size']]
-                # MODIFICATION START: Mixed precision PPO update
+            for start in range(0, b_size, rl_config['minibatch_size']):
+                mb_inds = b_inds[start:start + rl_config['minibatch_size']]
                 optimizer.zero_grad()
                 with autocast(device_type='cuda', enabled=use_amp):
-                    _,new_log_prob,entropy=agent(b_states[mb_inds],mode='rl_act',action=b_actions[mb_inds])
-                    ratio=torch.exp(new_log_prob-b_log_probs[mb_inds])
+                    # MODIFICATION: Unpack separate entropies
+                    new_joint_log_prob, new_nav_entropy, new_bfs_entropy = agent(
+                        b_states[mb_inds], mode='rl_update', 
+                        nav_action=b_nav_actions[mb_inds], 
+                        bfs_action=b_bfs_actions[mb_inds]
+                    )
+                    ratio = torch.exp(new_joint_log_prob - b_log_probs[mb_inds])
                     pg_loss1 = -b_advantages[mb_inds] * ratio
-                    pg_loss2 = -b_advantages[mb_inds] * torch.clamp(ratio, 1-grpo_params['clip_eps'], 1+grpo_params['clip_eps'])
+                    pg_loss2 = -b_advantages[mb_inds] * torch.clamp(ratio, 1 - grpo_params['clip_eps'], 1 + grpo_params['clip_eps'])
                     pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-                    ent_loss = entropy.mean()
+                    
+                    nav_ent_loss = new_nav_entropy.mean()
+                    bfs_ent_loss = new_bfs_entropy.mean()
+                    ent_loss = nav_ent_loss + bfs_ent_loss
+                    
                     loss = pg_loss - grpo_params['entropy_coef'] * ent_loss
                 
                 scaler.scale(loss).backward()
-                # Unscale gradients before clipping to avoid clipping scaled gradients
-                scaler.unscale_(optimizer) 
-                nn.utils.clip_grad_norm_(agent.parameters(),rl_config['grad_clip_norm'])
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(agent.parameters(), rl_config['grad_clip_norm'])
                 scaler.step(optimizer)
                 scaler.update()
-                # MODIFICATION END
-                pg_losses.append(pg_loss.item());ent_losses.append(ent_loss.item())
+                pg_losses.append(pg_loss.item())
+                nav_ent_losses.append(nav_ent_loss.item())
+                bfs_ent_losses.append(bfs_ent_loss.item())
 
         if update % CONFIG['logging']['log_interval'] == 0:
-            print(f"RL Update {update}/{num_updates}"); print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Entropy: {np.mean(ent_losses):.4f}")
+            print(f"RL Update {update}/{num_updates}")
+            # MODIFICATION: Update logging to show entropy breakdown
+            print(f"  Training -> Policy Loss: {np.mean(pg_losses):.4f} | Nav Entropy: {np.mean(nav_ent_losses):.2f} | BFS Entropy: {np.mean(bfs_ent_losses):.2f}")
             if update % CONFIG['logging']['eval_interval'] == 0:
-                rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'], **CONFIG['rl_navigation'])
+                rl_metrics = evaluate_rl_navigation(agent, device, **CONFIG['logging'])
                 print(f"  RL Validation -> Success: {rl_metrics['success_rate']:.1f}% | Length: {rl_metrics['avg_len']:.1f} | Efficiency: {rl_metrics['efficiency']:.2f}")
                 bfs_metrics = validate_bfs_prediction(agent, val_transitions, CONFIG['bfs_prediction']['batch_size'], device)
-                print(f"  BFS Validation -> Accuracy: {bfs_metrics['accuracy']:.2f}%")
+                print(f"  BFS Head Validation -> Accuracy: {bfs_metrics['accuracy']:.2f}%")
             print()
     print("RL Training complete!")
 
 def infer(agent,device,**kwargs):
-    print("\n=== Inference ===");infer_env=VectorizedGridWorldEnv(1,device,**CONFIG['env'],**CONFIG['shared']);obs_state=infer_env.reset();grid_size=infer_env.grid_size
+    print("\n=== Inference ==="); infer_env = VectorizedGridWorldEnv(1, device, **CONFIG['env'], **CONFIG['shared'])
+    obs_state = infer_env.reset(); grid_size=infer_env.grid_size
+    scratchpad = torch.full((1, grid_size, grid_size), bfs_stoi['UKN'], device=device)
+    scratchpad[0, infer_env.end_pos[0,0], infer_env.end_pos[0,1]] = bfs_stoi['0']
+    scratchpad[infer_env.grids == stoi['#']] = bfs_stoi['INF']
+    
+    action_map = {0: "UP", 1: "DOWN", 2: "LEFT", 3: "RIGHT", 4: "IDLE (THINK)"}
+
     for step in range(infer_env.max_steps):
-        print(f"\n--- Step {step+1} ---");
+        print(f"\n--- Step {step+1} ---")
         with torch.no_grad():
-            # MODIFICATION START: Use autocast during inference
             with autocast(device_type='cuda', enabled=use_amp):
-                scratchpad=torch.full((1,grid_size,grid_size),bfs_stoi['UKN'],device=device)
-                scratchpad[0,infer_env.end_pos[0,0],infer_env.end_pos[0,1]]=bfs_stoi['0'];scratchpad[infer_env.grids==stoi['#']]=bfs_stoi['INF']
-                current_board_state=torch.stack([obs_state,scratchpad],dim=1)
-                print("Agent is thinking...")
-                for think_step in range(kwargs['thinking_steps']):
-                    logits=agent(current_board_state,mode='bfs_predict');preds=logits.argmax(dim=-1);current_board_state[:,1,:,:]=preds.view(1,grid_size,grid_size)
-                print("Agent is acting...")
-                action=agent(current_board_state,mode='rl_act',deterministic=True)[0]
-            # MODIFICATION END
-        obs_state,reward,done,goal_reached=infer_env.step(action)
-        grid_vis=obs_state.cpu().numpy()[0];print("\n".join("".join(itos[c] for c in row) for row in grid_vis))
-        if goal_reached.any():print(f"\n✓ Success in {step+1} steps!");return
-        if done.any():print(f"\n✗ Timeout after {step+1} steps");return
+                current_board_state = torch.stack([obs_state, scratchpad], dim=1)
+                nav_action, bfs_action, _, _ = agent(current_board_state, mode='rl_rollout', deterministic=True)
+                scratchpad = bfs_action.view(1, grid_size, grid_size)
+        
+        print(f"Agent action: {action_map[nav_action.item()]}")
+        obs_state, reward, done, goal_reached = infer_env.step(nav_action)
+        grid_vis = obs_state.cpu().numpy()[0]; print("\n".join("".join(itos[c] for c in row) for row in grid_vis))
+        if goal_reached.any(): print(f"\n✓ Success in {step+1} steps!"); return
+        if done.any(): print(f"\n✗ Timeout after {step+1} steps"); return
     print(f"\n✗ Failed to reach goal")
+
 
 # ============================================================================
 # Main Execution
